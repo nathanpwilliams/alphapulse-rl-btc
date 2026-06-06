@@ -1,0 +1,31 @@
+# =============================================================================
+# AlphaPulse RL BTC Trading Bot - Core Requirements
+# =============================================================================
+#
+# For env + tests only (no training):
+#     pip install -r requirements.txt
+#
+# For full training capability (adds PyTorch + Stable Baselines 3):
+#     pip install -r requirements.txt -r requirements-train.txt
+#
+# Python >= 3.11 recommended.
+# =============================================================================
+
+# --- Numerical & data ---
+numpy>=1.24,<3
+pandas>=2.0,<3
+
+# --- Gym environment API ---
+# gymnasium is the maintained successor to OpenAI gym; SB3 v2.x supports it
+gymnasium>=0.29,<2
+
+# --- Plotting (env.render() and backtest analysis) ---
+matplotlib>=3.7,<4
+
+# --- Data fetching (Kraken Futures API in Phase 1) ---
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+
+# --- Testing ---
+pytest>=7.4,<9
+pytest-cov>=4.1,<6

@@ -1,0 +1,22 @@
+# =============================================================================
+# AlphaPulse RL BTC Trading Bot - Training Requirements
+# =============================================================================
+#
+# Install on top of requirements.txt for full training capability:
+#     pip install -r requirements.txt -r requirements-train.txt
+#
+# PyTorch is ~2GB. Skip this file if you only want to run env tests.
+#
+# For Apple Silicon Macs, torch will use MPS automatically.
+# For NVIDIA GPUs on Linux/Windows, install the CUDA-specific torch wheel:
+#     https://pytorch.org/get-started/locally/
+# =============================================================================
+
+# --- Deep learning backend ---
+torch>=2.0,<3
+
+# --- RL algorithms (PPO, A2C, SAC, etc.) ---
+stable-baselines3>=2.3,<3
+
+# --- Training metrics & visualization ---
+tensorboard>=2.15,<3

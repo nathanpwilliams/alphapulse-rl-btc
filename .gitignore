@@ -1,0 +1,118 @@
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# =============================================================================
+# Virtual environments
+# =============================================================================
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# =============================================================================
+# Testing & coverage
+# =============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# =============================================================================
+# Type checkers & linters
+# =============================================================================
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# =============================================================================
+# IDEs & OS
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# =============================================================================
+# *** SECRETS - DO NOT REMOVE THESE LINES ***
+# =============================================================================
+# Anything matching these patterns will be ignored by git, full stop.
+# If you accidentally commit a secret, it's exposed forever in the history
+# even if you delete the file. Rotate the key, don't just remove the commit.
+.env
+.env.*
+!.env.example
+secrets.json
+credentials.json
+api_keys.txt
+*.key
+*.pem
+*.p12
+
+# =============================================================================
+# Data - raw market data and large processed files
+# =============================================================================
+# Don't commit large data dumps. Re-download from source instead.
+data/raw/
+data/processed/
+data/cache/
+
+# But DO commit small test fixtures (whitelisted explicitly via negation)
+!tests/fixtures/
+!tests/fixtures/**
+
+# =============================================================================
+# Trained models & checkpoints
+# =============================================================================
+# Trained PPO checkpoints can be hundreds of MB. Use git-lfs or external
+# storage (S3, HuggingFace Hub, etc.) for sharing.
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.joblib
+
+# =============================================================================
+# Training logs
+# =============================================================================
+logs/
+runs/                # TensorBoard default
+tb_logs/             # TensorBoard alternative path
+wandb/               # Weights & Biases
+mlruns/              # MLflow
+lightning_logs/      # PyTorch Lightning
+
+# =============================================================================
+# Miscellaneous
+# =============================================================================
+scratch/             # personal scratch space
+tmp/
+*.log
