@@ -73,6 +73,10 @@ api_keys.txt
 *.key
 *.pem
 *.p12
+*.rtf
+*token*
+*credentials*
+*api_keys*
 
 # =============================================================================
 # Data - raw market data and large processed files
