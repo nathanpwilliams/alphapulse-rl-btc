@@ -112,3 +112,102 @@ Resume the ML work: tackle the overfitting finding from the first PPO run
 (more data, early stopping, smaller network, stronger regularization).
 
 ---
+## 2026-07-16 — Phase 2 experiment: more data reduces overfitting
+
+**Status:** First controlled overfitting experiment complete. Widening the
+training window from ~9mo to ~12mo visibly reduced the train/val divergence.
+
+### What I did
+
+Ran a single-variable experiment against the first PPO run's baseline: kept
+everything identical (50K timesteps, 4 envs, seed 42, all hyperparameters) and
+changed ONLY the data window, from 9 months (2025-08 -> 2026-05) to the full
+~12 months available from Kraken's funding history (2025-07-15 -> 2026-07-14).
+Verified the real funding range first via fetch_funding_rates (8,838 hourly rates,
+2025-07-13 -> 2026-07-16).
+
+### What worked
+
+Overfitting visibly decreased. Baseline: validation reward declined into negative
+(~-0.03) from step ~10K while training reward rose — classic memorization. This
+run: validation reward stayed small-but-POSITIVE (~+0.005) with no sustained
+downward trend, while training reward rose similarly (~-0.17 -> -0.14). The
+train/val divergence that defined the baseline was largely absent. value_loss
+declined cleanly (0.0017 -> 0.0003); explained_variance improved to ~-1.07.
+
+### What didn't / what surprised me
+
+Because the two runs train/validate on different market periods, absolute reward
+values aren't directly comparable — only the train-vs-val SHAPE is. The val
+reward's positive band is on a very zoomed-in axis (total range ~0.0003), so this
+is "not degrading on held-out data," not "now profitable." Explained_variance is
+still negative — the critic needs more training to value states well.
+
+### What I learned
+
+- Data was a genuine bottleneck: ~3 extra months of training data measurably
+  reduced overfitting at identical everything-else. This validates fixing data
+  before scaling timesteps.
+- The correct cross-run comparison for different data windows is the train/val
+  divergence pattern, not raw reward values.
+- Single-variable discipline paid off: because only the data changed, the reduced
+  overfitting is cleanly attributable to data, not confounded with other changes.
+
+### What's next
+
+Scale timesteps on the 12-month window (500K, 8 envs) and check whether val reward
+keeps holding while explained_variance finally crosses into positive. Then consider
+smaller network capacity and ent_coef tuning as further overfitting controls.
+
+---
+## 2026-07-16 — Phase 2 experiment: timesteps are double-edged
+
+**Status:** Second controlled experiment. Scaled timesteps 57K -> 500K on the
+12-month dataset. Fixed the critic but deepened overfitting — a key lesson in
+how training duration behaves.
+
+### What I did
+
+Held the 12-month data window and all hyperparameters fixed; changed timesteps
+(50K -> 500K) and n_envs (4 -> 8). Compared directly against the more_data_12mo
+run in TensorBoard. Training took ~2.3 min.
+
+### What worked
+
+The value function finally learned: train/explained_variance crossed from ~-12
+into POSITIVE territory, ending ~+0.39 (the 57K run never left negative). The
+critic now explains ~39% of return variance. Training reward climbed all the way
+to positive (~+0.09). value_loss declined cleanly and stayed stable (~0.0004).
+
+### What didn't / what surprised me
+
+Overfitting got WORSE with more timesteps. eval/mean_reward peaked early (~step
+50-70K, ~+0.007) then declined steadily to negative (~-0.033 around step 130K),
+while training reward kept rising to +0.09. The train-up/val-down divergence — the
+overfitting signature — was more pronounced at 500K than at 57K. Training longer
+let the agent memorize the ~10-month training period more thoroughly, at the cost
+of generalization.
+
+### What I learned
+
+- Timesteps is a double-edged variable: it fixed the critic (needed more steps to
+  learn value prediction) but deepened policy overfitting (extra steps fit noise
+  once real signal was exhausted).
+- The validation curve reveals BOTH the overfitting AND the optimal stopping point:
+  val reward peaked ~50-70K, so that's the model worth keeping. best_model.zip
+  captured it; final.zip at 500K is the overfit endpoint.
+- Data and timesteps interact: more data pushed the val peak later (7mo overfit at
+  ~10K steps; 12mo at ~50-70K). More useful timesteps require more data, not just
+  more steps.
+- The training reward curve is a trap — +0.09 looked like profitable learning but
+  was memorization. Only the val curve told the truth.
+
+### What's next
+
+Fight overfitting directly with single-variable experiments: smaller network
+([32,32] vs [64,64]) to reduce memorization capacity, and/or higher ent_coef
+(0.02-0.05) for more regularization. Verify which step best_model.zip was saved at.
+Hold data and timesteps fixed so any change is attributable to the regularization
+lever.
+
+---
