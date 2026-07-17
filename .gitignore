@@ -108,15 +108,21 @@ checkpoints/
 # Training logs
 # =============================================================================
 logs/
-runs/                # TensorBoard default
-tb_logs/             # TensorBoard alternative path
-wandb/               # Weights & Biases
-mlruns/              # MLflow
-lightning_logs/      # PyTorch Lightning
+# TensorBoard default
+runs/                
+# TensorBoard alternative path
+tb_logs/             
+# Weights & Biases
+wandb/               
+# MLflow
+mlruns/              
+# PyTorch Lightning
+lightning_logs/      
 
 # =============================================================================
 # Miscellaneous
 # =============================================================================
-scratch/             # personal scratch space
+# personal scratch space
+scratch/             
 tmp/
 *.log
