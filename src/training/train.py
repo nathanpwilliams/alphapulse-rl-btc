@@ -156,6 +156,7 @@ def build_ppo_model(
     train_env: DummyVecEnv,
     log_dir: Path,
     seed: int,
+    net_arch: list[int] | None = None,
 ) -> PPO:
     """Configure PPO with starting hyperparameters for small-state-space trading.
 
@@ -179,7 +180,9 @@ def build_ppo_model(
                             scale of data and aren't necessary for the policy
                             complexity our state can express.
     """
-    policy_kwargs = {"net_arch": [64, 64]}
+    if net_arch is None:
+        net_arch = [64, 64]
+    policy_kwargs = {"net_arch": net_arch}
 
     model = PPO(
         policy="MlpPolicy",
@@ -226,6 +229,7 @@ def save_run_config(
         "checkpoint_freq": args.checkpoint_freq,
         "eval_freq": args.eval_freq,
         "run_id": args.run_id,
+        "net_arch": args.net_arch,
         "timestamp": datetime.now().isoformat(),
     }
     config_path = model_dir / "run_config.json"
@@ -298,7 +302,8 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # 4. Build the model
-    model = build_ppo_model(train_env, log_dir, args.seed)
+    net_arch = [int(x) for x in args.net_arch.split(",")]
+    model = build_ppo_model(train_env, log_dir, args.seed, net_arch=net_arch)
     logger.info("PPO model constructed. Policy:\n%s", model.policy)
 
     # 5. Callbacks
@@ -383,6 +388,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Save checkpoint every N total timesteps")
     parser.add_argument("--eval-freq", type=int, default=10_000,
                         help="Evaluate on val env every N total timesteps")
+    parser.add_argument("--net-arch", type=str, default="64,64",
+                        help="Comma-separated hidden layer sizes, e.g. '32,32' or '64,64,64'")
     parser.add_argument("--run-id", type=str, default=None,
                         help="Optional run ID (default: auto-generated timestamp)")
     return parser.parse_args(argv)

@@ -223,7 +223,7 @@ class TestRunConfig:
             data_start="2025-01-01", data_end="2025-06-01",
             val_fraction=0.25, val_episode_length=120,
             checkpoint_freq=500, eval_freq=200,
-            run_id="test_run",
+            run_id="test_run", net_arch="64,64",
         )
         save_run_config(tmp_path, args, train_n=750, val_n=250)
 
@@ -237,3 +237,4 @@ class TestRunConfig:
         assert config["val_bars"] == 250
         assert config["run_id"] == "test_run"
         assert "timestamp" in config
+        assert config["net_arch"] == "64,64"
