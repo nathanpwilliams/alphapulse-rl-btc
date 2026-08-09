@@ -93,6 +93,73 @@ class FundingAnalyzerConfig:
 
 
 # ============================================================
+# Shared cost math
+# ============================================================
+#
+# These helpers hold the single source of truth for the cost-dependent
+# accounting. Both the single-cost path (`analyze_funding`) and the sweep path
+# (`sweep_costs`) call them, so the two can never diverge on the funding math.
+
+# Cap for the "minimum hold at which net turns positive" search: beyond ~90 days
+# a delta-neutral funding position is not a realistic hold, so we report None.
+MAX_POSITIVE_HOLD_HOURS = 2160  # 90 days
+
+
+def _break_even(mean_abs_hourly: float, cost_bps: float) -> dict[str, float]:
+    """Break-even holding period for one round-trip cost level.
+
+    Net funding P&L turns positive exactly when accumulated gross funding equals
+    the round-trip cost, so the analytic break-even IS the minimum positive hold.
+
+        funding earned per hour, in bps = mean_abs_hourly * 10_000
+        break_even_hours = cost_bps / (funding per hour in bps)
+    """
+    mean_abs_bps_per_hour = mean_abs_hourly * BPS_PER_UNIT  # rate -> bps
+    if mean_abs_bps_per_hour > 0:
+        break_even_hours: float = cost_bps / mean_abs_bps_per_hour
+    else:
+        # Zero funding everywhere: the cost is never recovered.
+        break_even_hours = float("inf")
+    return {
+        "round_trip_cost_bps": cost_bps,
+        "mean_abs_bps_per_hour": mean_abs_bps_per_hour,
+        "break_even_hours": break_even_hours,
+        "break_even_days": break_even_hours / 24.0,
+    }
+
+
+def _net_by_holding_period(
+    mean_abs_hourly: float,
+    cost_bps: float,
+    holding_periods_hours: tuple[int, ...],
+) -> dict[int, dict[str, float]]:
+    """Net-after-cost table over a set of holding periods for one cost level.
+
+    For each candidate holding period H: enter, hold H hours collecting the mean
+    absolute funding, then exit paying the full round-trip cost once.
+
+        gross_bps = mean_abs_hourly * 10_000 * H     (rate -> bps, times H hours)
+        net_bps   = gross_bps - cost_bps             (one round trip per hold)
+    Annualized net yield if this enter/hold/exit cycle repeats back-to-back:
+        cycles_per_year    = HOURS_PER_YEAR / H
+        annualized_net_pct = (net_bps / 10_000) * cycles_per_year * 100
+    """
+    table: dict[int, dict[str, float]] = {}
+    for h in holding_periods_hours:
+        gross_bps = mean_abs_hourly * BPS_PER_UNIT * h  # rate -> bps, over H hours
+        net_bps = gross_bps - cost_bps  # pay one round trip
+        cycles_per_year = HOURS_PER_YEAR / h
+        # net_bps / 10_000 converts bps back to a proportional per-cycle return.
+        annualized_net_pct = (net_bps / BPS_PER_UNIT) * cycles_per_year * 100
+        table[int(h)] = {
+            "gross_bps": float(gross_bps),
+            "net_bps": float(net_bps),
+            "annualized_net_pct": float(annualized_net_pct),
+        }
+    return table
+
+
+# ============================================================
 # Core analysis
 # ============================================================
 
@@ -182,21 +249,8 @@ def analyze_funding(
 
     # ---- 5. Cost hurdle / break-even holding period -----------------------
     # How many hours must we hold before accumulated gross funding (at the mean
-    # absolute per-hour rate) exceeds the round-trip cost?
-    #   funding earned per hour, in bps = mean_abs_hourly * 10_000
-    #   break_even_hours = round_trip_cost_bps / (funding per hour in bps)
-    mean_abs_bps_per_hour = mean_abs_hourly * BPS_PER_UNIT  # rate -> bps
-    if mean_abs_bps_per_hour > 0:
-        break_even_hours: float = config.round_trip_cost_bps / mean_abs_bps_per_hour
-    else:
-        # Zero funding everywhere: the cost is never recovered.
-        break_even_hours = float("inf")
-    cost_hurdle = {
-        "round_trip_cost_bps": config.round_trip_cost_bps,
-        "mean_abs_bps_per_hour": mean_abs_bps_per_hour,
-        "break_even_hours": break_even_hours,
-        "break_even_days": break_even_hours / 24.0,
-    }
+    # absolute per-hour rate) exceeds the round-trip cost? Shared helper.
+    cost_hurdle = _break_even(mean_abs_hourly, config.round_trip_cost_bps)
 
     # ---- 6. Sign-flip / reversal frequency --------------------------------
     # A "flip" is the funding rate changing sign from one interval to the next.
@@ -227,25 +281,11 @@ def analyze_funding(
     }
 
     # ---- 7. Net-after-cost yield by holding period ------------------------
-    # For each candidate holding period H: enter, hold H hours collecting the mean
-    # absolute funding, then exit paying the full round-trip cost once.
-    #   gross_bps = mean_abs_hourly * 10_000 * H        (rate -> bps, times H hours)
-    #   net_bps   = gross_bps - round_trip_cost_bps     (one round trip per hold)
-    # Annualized net yield if this enter/hold/exit cycle is repeated back-to-back:
-    #   cycles_per_year   = HOURS_PER_YEAR / H
-    #   annualized_net_pct = (net_bps / 10_000) * cycles_per_year * 100
-    net_by_holding_period: dict[int, dict[str, float]] = {}
-    for h in config.holding_periods_hours:
-        gross_bps = mean_abs_hourly * BPS_PER_UNIT * h  # rate -> bps, over H hours
-        net_bps = gross_bps - config.round_trip_cost_bps  # pay one round trip
-        cycles_per_year = HOURS_PER_YEAR / h
-        # net_bps / 10_000 converts bps back to a proportional per-cycle return.
-        annualized_net_pct = (net_bps / BPS_PER_UNIT) * cycles_per_year * 100
-        net_by_holding_period[int(h)] = {
-            "gross_bps": float(gross_bps),
-            "net_bps": float(net_bps),
-            "annualized_net_pct": float(annualized_net_pct),
-        }
+    # Shared helper: enter, hold H hours collecting mean absolute funding, exit
+    # paying one round trip. Same implementation the sweep path uses.
+    net_by_holding_period = _net_by_holding_period(
+        mean_abs_hourly, config.round_trip_cost_bps, config.holding_periods_hours
+    )
 
     return {
         "coverage": coverage,
@@ -261,6 +301,80 @@ def analyze_funding(
             "funding_period_hours": config.funding_period_hours,
         },
     }
+
+
+# ============================================================
+# Cost-sensitivity sweep
+# ============================================================
+
+def sweep_costs(
+    funding_df: pd.DataFrame,
+    config: FundingAnalyzerConfig,
+    cost_grid_bps: list[float],
+) -> dict[float, dict[str, Any]]:
+    """Run the net-after-cost analysis across several round-trip cost levels.
+
+    The funding statistic that drives every cost figure - the mean absolute
+    per-hour rate - depends only on the data, not on cost, so it is computed once
+    (via `analyze_funding`) and reused for every level in the grid. Only the
+    cost-dependent break-even and net-table math is re-run per cost, through the
+    same `_break_even` / `_net_by_holding_period` helpers the single-cost path
+    uses. Nothing here re-implements the funding math.
+
+    Args:
+        funding_df: DataFrame with a DatetimeIndex and a `funding_rate` column of
+            PER-HOUR proportional funding rates.
+        config: base analysis parameters (symbol, holding-period grid). Its
+            `round_trip_cost_bps` is ignored here in favor of `cost_grid_bps`.
+        cost_grid_bps: round-trip cost levels in basis points to sweep over.
+
+    Returns:
+        A dict keyed by cost level (float bps). Each value contains:
+            round_trip_cost_bps, break_even_hours, break_even_days,
+            min_positive_hold_hours, min_positive_hold_days,
+            net_by_holding_period (H -> {gross_bps, net_bps, annualized_net_pct}).
+
+        `min_positive_hold_*` equals the analytic break-even (net turns positive
+        exactly there); it is `None` if the break-even exceeds
+        MAX_POSITIVE_HOLD_HOURS (90 days) or funding is zero.
+
+    Raises:
+        ValueError: if `cost_grid_bps` is empty, or `funding_df` is invalid
+            (propagated from `analyze_funding`).
+    """
+    if not cost_grid_bps:
+        raise ValueError("cost_grid_bps must contain at least one cost level")
+
+    # Compute the data-dependent stats once; mean_abs_hourly is cost-independent.
+    base_stats = analyze_funding(funding_df, config)
+    mean_abs_hourly = base_stats["magnitude"]["mean_abs_hourly"]
+
+    results: dict[float, dict[str, Any]] = {}
+    for cost_bps in cost_grid_bps:
+        hurdle = _break_even(mean_abs_hourly, cost_bps)
+        net_table = _net_by_holding_period(
+            mean_abs_hourly, cost_bps, config.holding_periods_hours
+        )
+
+        # Net turns positive exactly at the analytic break-even. Surface it,
+        # capped at a realistic maximum hold; beyond the cap report None.
+        be_hours = hurdle["break_even_hours"]
+        if be_hours <= MAX_POSITIVE_HOLD_HOURS:
+            min_positive_hold_hours: float | None = be_hours
+            min_positive_hold_days: float | None = be_hours / 24.0
+        else:
+            min_positive_hold_hours = None
+            min_positive_hold_days = None
+
+        results[cost_bps] = {
+            "round_trip_cost_bps": cost_bps,
+            "break_even_hours": be_hours,
+            "break_even_days": hurdle["break_even_days"],
+            "min_positive_hold_hours": min_positive_hold_hours,
+            "min_positive_hold_days": min_positive_hold_days,
+            "net_by_holding_period": net_table,
+        }
+    return results
 
 
 # ============================================================
@@ -355,6 +469,76 @@ def format_summary(stats: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_sweep(sweep: dict[float, dict[str, Any]], symbol: str) -> str:
+    """Render a cost-sensitivity sweep as a per-cost breakdown + compact summary."""
+    lines: list[str] = []
+    bar = "=" * 72
+    lines.append(bar)
+    lines.append(f"  FUNDING-RATE ARB - COST-SENSITIVITY SWEEP - {symbol}")
+    lines.append(bar)
+
+    costs = sorted(sweep)
+
+    # ---- Per-cost sections -------------------------------------------------
+    for cost_bps in costs:
+        entry = sweep[cost_bps]
+        net = entry["net_by_holding_period"]
+        mph = entry["min_positive_hold_hours"]
+        mpd = entry["min_positive_hold_days"]
+        if mph is None:
+            min_pos = "never (> 90d cap)"
+        else:
+            min_pos = f"{mph:,.1f} hrs ({mpd:,.2f} days)"
+
+        lines.append("")
+        lines.append(f"Round-trip cost = {cost_bps:.1f} bps")
+        lines.append("-" * 72)
+        lines.append(f"  Break-even hold      : {entry['break_even_hours']:,.1f} hours"
+                     f"  ({entry['break_even_days']:,.2f} days)")
+        lines.append(f"  Min positive hold    : {min_pos}")
+        lines.append(f"  {'Hold':>6}  {'':>5}  {'gross':>10}  {'net':>10}  {'annualized':>12}")
+        lines.append(f"  {'(hrs)':>6}  {'(d)':>5}  {'(bps)':>10}  {'(bps)':>10}  {'net (%/yr)':>12}")
+        for h in sorted(net):
+            row = net[h]
+            lines.append(
+                f"  {h:>6}  {h / 24:>5.0f}  {row['gross_bps']:>10.4f}"
+                f"  {row['net_bps']:>+10.4f}  {row['annualized_net_pct']:>+12.2f}"
+            )
+
+    # ---- Compact top-level comparison --------------------------------------
+    lines.append("")
+    lines.append("Summary (net_bps at selected holds)")
+    lines.append("-" * 72)
+    lines.append(
+        f"  {'cost':>6}  {'break-even':>11}  {'net@7d':>9}  {'net@14d':>9}"
+        f"  {'net@30d':>9}  {'ann@30d':>9}"
+    )
+    lines.append(
+        f"  {'(bps)':>6}  {'(days)':>11}  {'(bps)':>9}  {'(bps)':>9}"
+        f"  {'(bps)':>9}  {'(%/yr)':>9}"
+    )
+    for cost_bps in costs:
+        entry = sweep[cost_bps]
+        net = entry["net_by_holding_period"]
+        be_days = entry["break_even_days"]
+        be_str = "inf" if be_days == float("inf") else f"{be_days:,.2f}"
+        # These holds are the standard grid; guard with .get in case of a custom grid.
+        n7 = net.get(168, {}).get("net_bps", float("nan"))
+        n14 = net.get(336, {}).get("net_bps", float("nan"))
+        n30 = net.get(720, {}).get("net_bps", float("nan"))
+        ann30 = net.get(720, {}).get("annualized_net_pct", float("nan"))
+        lines.append(
+            f"  {cost_bps:>6.1f}  {be_str:>11}  {n7:>+9.3f}  {n14:>+9.3f}"
+            f"  {n30:>+9.3f}  {ann30:>+9.2f}"
+        )
+
+    lines.append("")
+    lines.append(bar)
+    lines.append("  Diagnostic only. No viability conclusion is drawn here.")
+    lines.append(bar)
+    return "\n".join(lines)
+
+
 # ============================================================
 # CLI entrypoint
 # ============================================================
@@ -375,6 +559,18 @@ def main(argv: list[str] | None = None) -> None:
         default=20.0,
         help="All-in round-trip transaction cost in basis points (default: 20.0).",
     )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Run a cost-sensitivity sweep across --cost-grid instead of a "
+             "single-cost summary.",
+    )
+    parser.add_argument(
+        "--cost-grid",
+        default="5,10,15,20,25",
+        help="Comma-separated round-trip cost levels in bps for --sweep "
+             "(default: 5,10,15,20,25).",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -390,8 +586,13 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("Fetching Kraken funding rates for %s ...", config.symbol)
     funding_df = fetch_funding_rates(config.symbol)
 
-    stats = analyze_funding(funding_df, config)
-    print(format_summary(stats))
+    if args.sweep:
+        cost_grid = [float(c) for c in args.cost_grid.split(",") if c.strip()]
+        sweep = sweep_costs(funding_df, config, cost_grid)
+        print(format_sweep(sweep, config.symbol))
+    else:
+        stats = analyze_funding(funding_df, config)
+        print(format_summary(stats))
 
 
 if __name__ == "__main__":

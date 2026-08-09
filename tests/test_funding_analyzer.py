@@ -24,9 +24,12 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.strategies.funding.analyzer import (  # noqa: E402
     HOURS_PER_YEAR,
+    MAX_POSITIVE_HOLD_HOURS,
     FundingAnalyzerConfig,
     analyze_funding,
     format_summary,
+    format_sweep,
+    sweep_costs,
 )
 
 
@@ -218,3 +221,100 @@ class TestUnitConversions:
         stats = analyze_funding(constant_funding(1e-5, n=100), FundingAnalyzerConfig())
         assert stats["coverage"]["n_observations"] == 100
         assert stats["coverage"]["total_hours_covered"] == pytest.approx(99.0)
+
+
+# ============================================================
+# Cost-sensitivity sweep
+# ============================================================
+
+class TestSweepCosts:
+
+    GRID = [5.0, 10.0, 15.0, 20.0, 25.0]
+
+    def test_one_entry_per_cost_level(self):
+        sweep = sweep_costs(constant_funding(1e-5), FundingAnalyzerConfig(), self.GRID)
+        assert set(sweep.keys()) == set(self.GRID)
+        for cost, entry in sweep.items():
+            assert entry["round_trip_cost_bps"] == cost
+            assert set(entry["net_by_holding_period"].keys()) == set(
+                FundingAnalyzerConfig().holding_periods_hours
+            )
+
+    def test_break_even_scales_linearly_with_cost(self):
+        rate = 1e-5
+        sweep = sweep_costs(constant_funding(rate), FundingAnalyzerConfig(), [10.0, 20.0])
+        be10 = sweep[10.0]["break_even_hours"]
+        be20 = sweep[20.0]["break_even_hours"]
+        assert be20 == pytest.approx(2.0 * be10)
+        # And matches the closed form for the 10 bps level.
+        assert be10 == pytest.approx(10.0 / (rate * 10_000))
+
+    def test_net_bps_matches_hand_computed(self):
+        rate = 1e-4  # 1 bps/hr
+        cost = 15.0
+        sweep = sweep_costs(constant_funding(rate), FundingAnalyzerConfig(), [cost])
+        h = 336  # 14 days
+        expected_gross = rate * 10_000 * h  # 336 bps
+        expected_net = expected_gross - cost
+        row = sweep[cost]["net_by_holding_period"][h]
+        assert row["gross_bps"] == pytest.approx(expected_gross)
+        assert row["net_bps"] == pytest.approx(expected_net)
+
+    def test_break_even_monotonic_in_cost(self):
+        sweep = sweep_costs(constant_funding(1e-5), FundingAnalyzerConfig(), self.GRID)
+        be = [sweep[c]["break_even_hours"] for c in sorted(sweep)]
+        # Higher cost => strictly later break-even.
+        assert all(be[i] < be[i + 1] for i in range(len(be) - 1))
+
+    def test_min_positive_hold_equals_break_even(self):
+        sweep = sweep_costs(constant_funding(1e-5), FundingAnalyzerConfig(), [20.0])
+        entry = sweep[20.0]
+        assert entry["min_positive_hold_hours"] == pytest.approx(entry["break_even_hours"])
+
+    def test_min_positive_hold_none_beyond_cap(self):
+        # Tiny funding + high cost pushes break-even past the 90-day cap.
+        sweep = sweep_costs(constant_funding(1e-7), FundingAnalyzerConfig(), [20.0])
+        entry = sweep[20.0]
+        assert entry["break_even_hours"] > MAX_POSITIVE_HOLD_HOURS
+        assert entry["min_positive_hold_hours"] is None
+        assert entry["min_positive_hold_days"] is None
+
+    def test_empty_grid_raises(self):
+        with pytest.raises(ValueError, match="at least one"):
+            sweep_costs(constant_funding(1e-5), FundingAnalyzerConfig(), [])
+
+    def test_sweep_summary_renders(self):
+        sweep = sweep_costs(constant_funding(1e-5), FundingAnalyzerConfig(), self.GRID)
+        text = format_sweep(sweep, "PF_XBTUSD")
+        assert "COST-SENSITIVITY SWEEP" in text
+        assert "Summary" in text
+
+
+class TestSweepMatchesSingleCost:
+    """The refactor must not create two divergent funding-math paths."""
+
+    def test_sweep_and_analyze_agree_on_net(self):
+        rate = 3.3e-5
+        cost = 12.0
+        cfg = FundingAnalyzerConfig(round_trip_cost_bps=cost)
+        df = constant_funding(rate)
+
+        single = analyze_funding(df, cfg)["net_by_holding_period"]
+        swept = sweep_costs(df, cfg, [cost])[cost]["net_by_holding_period"]
+
+        assert single.keys() == swept.keys()
+        for h in single:
+            assert single[h]["gross_bps"] == pytest.approx(swept[h]["gross_bps"])
+            assert single[h]["net_bps"] == pytest.approx(swept[h]["net_bps"])
+            assert single[h]["annualized_net_pct"] == pytest.approx(
+                swept[h]["annualized_net_pct"]
+            )
+
+    def test_sweep_and_analyze_agree_on_break_even(self):
+        rate = 3.3e-5
+        cost = 12.0
+        cfg = FundingAnalyzerConfig(round_trip_cost_bps=cost)
+        df = constant_funding(rate)
+        single_be = analyze_funding(df, cfg)["cost_hurdle"]["break_even_hours"]
+        swept_be = sweep_costs(df, cfg, [cost])[cost]["break_even_hours"]
+        assert single_be == pytest.approx(swept_be)
