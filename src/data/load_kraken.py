@@ -57,9 +57,6 @@ PER_REQUEST_DELAY_SEC = 0.5
 MAX_RETRIES = 3
 RETRY_BACKOFF_SEC = 2.0
 
-# Chunk size for OHLC pagination - 1 year fits well under Kraken's limit
-CHUNK_DAYS = 365
-
 # Valid resolutions per Kraken docs
 VALID_RESOLUTIONS = {"1m", "5m", "15m", "30m", "1h", "4h", "12h", "1d", "1w"}
 
@@ -148,8 +145,12 @@ def fetch_ohlcv(
 ) -> pd.DataFrame:
     """Fetch OHLCV bars from Kraken Futures over the given date range.
 
-    Handles pagination internally by chunking the date range into
-    CHUNK_DAYS-sized windows.
+    Paginates by following Kraken's `more_candles` flag rather than guessing a
+    chunk size. Kraken caps each charts response at ~2000 candles and sets
+    `more_candles=True` when it truncates; we advance a `from` cursor to just past
+    the last returned candle and refetch until the API reports no more candles or
+    we reach `end`. This is resolution-agnostic: a truncated 4H window and a
+    truncated 1H window are handled identically, with no silently dropped tail.
 
     Args:
         symbol: e.g., "PF_XBTUSD"
@@ -173,25 +174,59 @@ def fetch_ohlcv(
 
     logger.info("Fetching OHLCV: %s %s from %s to %s", symbol, resolution, start_dt, end_dt)
 
-    # Chunk the request to respect API limits
+    # Cursor-driven pagination. `from`/`to` are Unix SECONDS (Kraken's charts
+    # params); candle `time` is Unix MILLISECONDS. The requested end is fixed;
+    # only the `from` cursor moves forward as we page.
     all_candles: list[dict] = []
-    chunk_start = start_dt
-    chunk_delta = pd.Timedelta(days=CHUNK_DAYS)
+    to_ts = int(end_dt.timestamp())
+    cursor_ts = int(start_dt.timestamp())
 
-    while chunk_start < end_dt:
-        chunk_end = min(chunk_start + chunk_delta, end_dt)
-        from_ts = int(chunk_start.timestamp())
-        to_ts = int(chunk_end.timestamp())
+    # Belt-and-suspenders cap on total requests. The cursor-advance check below is
+    # the real termination guard; MAX_PAGES only bounds a pathological API. At
+    # ~2000 candles/page this is far more than any realistic multi-year request.
+    MAX_PAGES = 10_000
 
-        candles, more = _fetch_ohlcv_chunk(symbol, from_ts, to_ts, resolution)
-        logger.info(
-            "  Chunk %s -> %s: %d candles (more_candles=%s)",
-            chunk_start.date(), chunk_end.date(), len(candles), more,
-        )
+    for page_i in range(1, MAX_PAGES + 1):
+        candles, more = _fetch_ohlcv_chunk(symbol, cursor_ts, to_ts, resolution)
+        if not candles:
+            # No candles at/after the cursor within range: history is exhausted.
+            break
         all_candles.extend(candles)
 
-        chunk_start = chunk_end
+        # Last candle's bar-start time (ms -> s). Dedupe in _candles_to_dataframe
+        # is the safety net for any boundary overlap.
+        last_ms = max(int(c["time"]) for c in candles)
+        last_s = last_ms // 1000
+        logger.info(
+            "  Page %d: %d candles up to %s (more_candles=%s)",
+            page_i, len(candles),
+            pd.to_datetime(last_ms, unit="ms", utc=True), more,
+        )
+
+        # Done when the API says there's no more, or we've reached the end.
+        if not more or last_s >= to_ts:
+            break
+
+        # Advance to just past the last candle: the next page starts at the
+        # following bar (no gap) without re-requesting the boundary bar (no dup).
+        next_cursor_ts = last_s + 1
+        if next_cursor_ts <= cursor_ts:
+            # Cursor failed to move forward (API returned only stale/older bars):
+            # stop rather than spin. Data may be incomplete; say so.
+            logger.warning(
+                "OHLCV pagination cursor did not advance (last candle %s <= cursor "
+                "%s); stopping to avoid an infinite loop. Data may be incomplete.",
+                pd.to_datetime(last_ms, unit="ms", utc=True),
+                pd.to_datetime(cursor_ts, unit="s", utc=True),
+            )
+            break
+        cursor_ts = next_cursor_ts
         time.sleep(PER_REQUEST_DELAY_SEC)
+    else:
+        logger.warning(
+            "OHLCV pagination hit MAX_PAGES=%d; assembled history may be truncated.",
+            MAX_PAGES,
+        )
 
     if not all_candles:
         raise ValueError(

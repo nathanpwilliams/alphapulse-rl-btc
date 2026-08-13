@@ -174,6 +174,108 @@ class TestFetchOHLCV:
                 lk.fetch_ohlcv("PF_XBTUSD", "2024-01-01", "2024-01-02", "4h")
 
 
+class TestFetchOHLCVPagination:
+    """Regression guard for the ~1-month-per-year silent data loss.
+
+    Kraken's charts endpoint caps each response at 2000 candles and sets
+    `more_candles=True` when it truncates. fetch_ohlcv must FOLLOW that flag and
+    reassemble the full continuous range - it previously chunked by a fixed 365
+    days, ignored `more_candles`, and dropped the truncated tail (~1mo) of every
+    >2000-bar window. These tests simulate the cap at the HTTP layer.
+    """
+
+    CAP = 2000  # Kraken's per-response candle cap
+
+    def _full_series(self, start_dt, n_bars, bar_hours=4.0):
+        """Ground-truth continuous candle list (ascending by time)."""
+        return [
+            make_candle(
+                int((start_dt + pd.Timedelta(hours=bar_hours * i)).timestamp() * 1000),
+                40000.0 * (1.0 + 0.0001 * i),
+            )
+            for i in range(n_bars)
+        ]
+
+    def _fake_server(self, all_candles):
+        """Mock that honors from/to and enforces the 2000-candle cap + flag."""
+        def fake(url, params=None):
+            frm_ms = int(params["from"]) * 1000  # charts params are in seconds
+            to_ms = int(params["to"]) * 1000
+            in_range = [c for c in all_candles if frm_ms <= c["time"] <= to_ms]
+            page = in_range[: self.CAP]
+            return {"candles": page, "more_candles": len(in_range) > self.CAP}
+        return fake
+
+    def test_paginates_beyond_2000_cap_no_gaps(self):
+        # 2500 4H bars (~416 days) forces a truncated first page + a completing
+        # second page - the exact shape that used to lose the tail.
+        start_dt = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        n_bars = 2500
+        full = self._full_series(start_dt, n_bars)
+        end = start_dt + pd.Timedelta(hours=4 * n_bars)
+
+        with patch.object(lk, "_http_get_json", side_effect=self._fake_server(full)) as m:
+            df = lk.fetch_ohlcv("PF_XBTUSD", start_dt, end, "4h")
+
+        # Full range reassembled - nothing dropped.
+        assert len(df) == n_bars
+        # A bar in the region the OLD code dropped (past the 2000th) is present.
+        dropped_region_bar = start_dt + pd.Timedelta(hours=4 * 2300)
+        assert dropped_region_bar in df.index
+        # No duplicates, monotonic index.
+        assert df.index.is_monotonic_increasing
+        assert not df.index.duplicated().any()
+        # Continuity: no gap exceeds the 4h bar interval anywhere in the series.
+        gaps = df.index.to_series().diff().dropna()
+        assert gaps.max() <= pd.Timedelta(hours=4)
+        # It actually paged (would be a single truncated call otherwise).
+        assert m.call_count == 2
+
+    def test_paginates_1h_resolution(self):
+        # Resolution-agnostic: same behavior for 1H (2300 bars > cap).
+        start_dt = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        n_bars = 2300
+        full = self._full_series(start_dt, n_bars, bar_hours=1.0)
+        end = start_dt + pd.Timedelta(hours=n_bars)
+
+        with patch.object(lk, "_http_get_json", side_effect=self._fake_server(full)) as m:
+            df = lk.fetch_ohlcv("PF_XBTUSD", start_dt, end, "1h")
+
+        assert len(df) == n_bars
+        gaps = df.index.to_series().diff().dropna()
+        assert gaps.max() <= pd.Timedelta(hours=1)
+        assert m.call_count == 2
+
+    def test_single_page_under_cap_unaffected(self):
+        # The common <=2000-bar case still works in exactly one request.
+        start_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        full = self._full_series(start_dt, n_bars=100)
+        end = start_dt + pd.Timedelta(hours=4 * 100)
+
+        with patch.object(lk, "_http_get_json", side_effect=self._fake_server(full)) as m:
+            df = lk.fetch_ohlcv("PF_XBTUSD", start_dt, end, "4h")
+
+        assert len(df) == 100
+        assert m.call_count == 1
+
+    def test_stuck_cursor_terminates(self):
+        # Pathological server that never advances (always the same bar, more=True).
+        # The cursor-advance guard must break instead of looping forever.
+        start_dt = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        one = make_candle(int(start_dt.timestamp() * 1000), 40000.0)
+
+        def fake(url, params=None):
+            return {"candles": [one], "more_candles": True}
+
+        with patch.object(lk, "_http_get_json", side_effect=fake):
+            df = lk.fetch_ohlcv(
+                "PF_XBTUSD", start_dt, start_dt + pd.Timedelta(hours=4 * 3000), "4h"
+            )
+
+        # Terminated (did not hang) and returned the single deduped bar.
+        assert len(df) == 1
+
+
 class TestFetchFunding:
 
     def test_fetches_and_returns_dataframe(self):
