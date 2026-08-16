@@ -20,3 +20,7 @@ stable-baselines3>=2.3,<3
 
 # --- Training metrics & visualization ---
 tensorboard>=2.15,<3
+
+# --- Regime detection (Hidden Markov Models) ---
+# Pulls scipy + scikit-learn as transitive deps if not already present.
+hmmlearn>=0.3,<0.4
