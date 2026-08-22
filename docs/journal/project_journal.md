@@ -211,3 +211,53 @@ Hold data and timesteps fixed so any change is attributable to the regularizatio
 lever.
 
 ---
+## 2026-07-17 — Phase 2 experiment: smaller network + the data-constraint conclusion
+
+**Status:** Third single-variable experiment complete. Reduced capacity
+([64,64]→[32,32]) softened mid-training overfitting and kept the critic healthy,
+but both nets converged to similar poor val reward by 500K. Cross-experiment
+conclusion: data volume is the binding constraint.
+
+### What I did
+
+Added a --net-arch CLI flag (captured in run_config.json; a stale test fixture
+caught the schema change and was fixed). Ran smaller_net_32: identical to
+more_data_500k except net_arch [32,32] vs [64,64].
+
+### What worked
+
+Reduced capacity softened overfitting through the middle of training (100K-300K):
+the smaller net's val reward held higher than the larger net's overfitting trough.
+Critically, this cost nothing on the critic — explained_variance ended slightly
+HIGHER for the smaller net (0.485 vs 0.442). So: less overfitting, equal/better
+value function, fewer parameters, faster. The 24-dim state simply doesn't need a
+large network; the extra capacity in [64,64] mostly enabled policy memorization.
+
+### What didn't / what surprised me
+
+By 500K, both nets CONVERGED to similar poor final val reward (~-0.04 to -0.047).
+The smaller net was better *along the way* but not *at the endpoint*. Capacity
+reduction delays and softens overfitting but doesn't escape it — because the real
+constraint isn't architecture.
+
+### What I learned
+
+- Network capacity is a real but limited overfitting lever: it improves the
+  trajectory and the best-checkpoint window, not the 500K endpoint.
+- Smaller network here is strictly better engineering: equal generalization,
+  better critic, fewer params, faster — no downside found.
+- CROSS-EXPERIMENT CONCLUSION: three experiments (more data helped; more timesteps
+  deepened overfitting; smaller net only softened it) all point to the same
+  binding constraint — data volume. ~10 months of BTC 4H history lacks enough
+  distinct regimes for a policy to generalize to a held-out period. The answer
+  isn't more tuning; it's more/more-diverse data.
+
+### What's next
+
+Decision fork: (1) accept data volume as the documented constraint and use the
+early-stopped smaller-net best_model.zip as the best-effort model, or (2) attack
+the constraint directly with multi-year data from a paid provider (CoinAPI/
+Amberdata) or additional assets. Leaning toward documenting the finding and, if
+continuing, sourcing more data rather than further tuning.
+
+---
