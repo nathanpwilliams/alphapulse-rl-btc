@@ -261,3 +261,76 @@ Amberdata) or additional assets. Leaning toward documenting the finding and, if
 continuing, sourcing more data rather than further tuning.
 
 ---
+## 2026-08-22 — Level 2: regime-as-filter backtest (tradeability test)
+
+**Status:** Built the regime-filtered backtest to test whether Level 1's validated
+regime structure translates into a tradeable edge — regime filter (long favorable
+regimes / cash otherwise) vs buy-and-hold, on walk-forward regime labels with honest
+cost and detection-lag accounting.
+
+### What I did
+
+Built src/strategies/regime/backtest.py, reusing the Level 1 HMM detector. Regimes
+assigned walk-forward (HMM refit on a rolling cadence, each bar labeled only from its
+past) to avoid look-ahead; strategy acts on the prior-bar regime to model detection
+lag. Long/flat filter: hold the asset in favorable regimes (positive drift, below-
+median vol as known at decision time), cash otherwise, with per-side transaction
+costs. Compares Sharpe, max drawdown, annualized return, time-in-market, and turnover
+against buy-and-hold. Parameterized for asset/resolution with per-asset AIC/BIC state
+selection (no hardcoded regime count) and detector/eval separation, as seams for the
+future multi-asset regime scanner. 20 tests, look-ahead and lag guards non-negotiable.
+
+To support walk-forward without look-ahead, the detector was refactored minimally: the
+z-score scaler was split into `_scaler_stats` + `_apply_scaler` (so test bars are
+standardized with training-window statistics only), and a reusable `fit_model`
+(fit-with-scaler, no decode) was extracted; `fit_regimes` now builds on it and the
+Level 1 single-fit diagnostic path is unchanged.
+
+### What the backtest showed
+
+Live PF_XBTUSD 4H, 2022-11-30 → 2026-08-21, 8,165 bars traded. n_states auto-selected
+= 4 (BIC, from first 1,500 bars), 46 walk-forward refits, 10 bps/side cost. The filter
+was in market 32% of the time with 592 position changes.
+
+| Metric | Regime filter | Buy & hold |
+| --- | --- | --- |
+| Annualized return | -10.59% | +51.01% |
+| Annualized vol | 22.25% | 45.73% |
+| Sharpe (rf=0) | -0.392 | +1.130 |
+| Max drawdown | -51.58% | -53.55% |
+| Calmar | -0.205 | +0.952 |
+
+Sharpe uplift (filter − hold) = -1.522; drawdown change = +1.97 pp (filter marginally
+shallower). The filter roughly halved volatility but surrendered essentially all
+return and posted a negative Sharpe; drawdown protection was negligible despite being
+in cash 68% of the time. Numbers only — no viability verdict.
+
+### What I learned
+
+- Walk-forward labels are far more conservative than Level 1's in-sample Viterbi
+  decode: the regime known only from the past is lagged and noisier than the
+  full-sample path. This is exactly why in-sample-labelled backtests are worthless —
+  the honest label is what determines tradeability, and it is a weaker signal.
+- The "positive drift + below-median vol" favorable rule kept the book in cash 68% of
+  the time, and much of BTC's return over this window came in bars the rule flags as
+  unfavorable (higher-vol up-moves). Filtering those out surrendered the trend — the
+  filter cut vol ~in half (22% vs 46%) but gave up the upside with it.
+- Drawdown barely improved (−51.6% vs −53.6%) despite low exposure: being in cash most
+  of the time did NOT reliably sidestep the large declines. With one-bar detection lag
+  and a 180-bar refit cadence, the filter re-enters into/holds through drawdowns rather
+  than avoiding them.
+- Turnover is modest: 592 changes over 8,165 bars (~7% of bars flip), so transaction
+  cost is not the primary driver of underperformance — the long/flat signal itself is.
+- Compute: honest walk-forward (per-bar causal decode from each refit boundary + 46
+  refits × 5 restarts) ran ~4.3 min on full history. The per-bar decode is the
+  expensive-but-honest part; a future scanner would cache fits and label incrementally.
+
+### What's next
+
+Interpretation of tradeability happens with the lead. If regime-filtering improves
+risk-adjusted return, Level 3 (regime-conditional RL / regime as a state feature —
+the direct fix for the earlier single-policy overfitting) is justified, and the
+multi-asset recurring scanner becomes the infrastructure build. If not, regimes are
+real-but-not-exploitable-this-way and we reconsider the filter design.
+
+---
