@@ -144,13 +144,30 @@ def compute_features(ohlcv: pd.DataFrame, config: RegimeConfig) -> pd.DataFrame:
     return features
 
 
-def _standardize(features: pd.DataFrame) -> np.ndarray:
-    """Z-score each feature column (full-sample; see module docstring caveat)."""
+def _scaler_stats(features: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Per-column (mean, std) used to z-score features. std==0 -> 1 (flat column)."""
     x = features.to_numpy(dtype=float)
     mean = x.mean(axis=0)
     std = x.std(axis=0)
     std = np.where(std > 0, std, 1.0)  # avoid divide-by-zero on a flat column
-    return (x - mean) / std
+    return mean, std
+
+
+def _apply_scaler(features: pd.DataFrame, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """Apply a PRE-COMPUTED (mean, std) z-scoring to `features`.
+
+    Split out from `_standardize` so a walk-forward caller can fit the scaler on a
+    TRAINING window and transform later out-of-sample bars with the SAME statistics
+    - standardizing test bars with their own (future-inclusive) stats would itself
+    be a form of look-ahead.
+    """
+    return (features.to_numpy(dtype=float) - mean) / std
+
+
+def _standardize(features: pd.DataFrame) -> np.ndarray:
+    """Z-score each feature column (full-sample; see module docstring caveat)."""
+    mean, std = _scaler_stats(features)
+    return _apply_scaler(features, mean, std)
 
 
 # ============================================================
@@ -200,26 +217,22 @@ def _aic_bic(log_likelihood: float, n_params: int, n_obs: int) -> tuple[float, f
 # Fitting
 # ============================================================
 
-def fit_regimes(features: pd.DataFrame, n_states: int, config: RegimeConfig) -> dict[str, Any]:
-    """Fit a GaussianHMM with `n_states` and decode the regime sequence.
+def fit_model(features: pd.DataFrame, n_states: int, config: RegimeConfig) -> dict[str, Any]:
+    """Fit a GaussianHMM (best of `n_restarts`) and return it WITH its scaler.
 
-    Runs `config.n_restarts` fits from different seeds and keeps the one with the
-    highest log-likelihood (HMMs are init-sensitive). Features are z-scored before
-    fitting (Gaussian emissions are scale-sensitive).
-
-    Args:
-        features: raw feature DataFrame from `compute_features`.
-        n_states: number of HMM hidden states.
-        config: regime parameters.
+    This is the reusable fitting core - it z-scores `features`, runs the restart
+    sweep, and returns the winning model plus the (mean, std) it was standardized
+    with, but does NOT decode. Walk-forward callers use it to fit on a training
+    window, then transform later bars with the returned scaler (no look-ahead) and
+    decode them causally. `fit_regimes` builds on it for the single-fit diagnostic.
 
     Returns:
-        dict with keys: model (fitted GaussianHMM), states (np.ndarray of decoded
-        Viterbi states aligned positionally to `features`), index (the feature
-        DatetimeIndex), log_likelihood, n_params, aic, bic, n_states, converged.
+        dict: model, scaler_mean, scaler_std, log_likelihood, n_features, converged.
     """
     from hmmlearn.hmm import GaussianHMM  # local import: heavy optional dependency
 
-    x = _standardize(features)
+    mean, std = _scaler_stats(features)
+    x = _apply_scaler(features, mean, std)
     n_obs, n_features = x.shape
 
     best_model = None
@@ -243,20 +256,53 @@ def fit_regimes(features: pd.DataFrame, n_states: int, config: RegimeConfig) -> 
     if best_model is None:
         raise RuntimeError(f"All {config.n_restarts} HMM restarts failed for n_states={n_states}")
 
-    states = best_model.predict(x)  # Viterbi most-likely state per bar
-    n_params = _hmm_n_params(n_states, n_features, config.covariance_type)
-    aic, bic = _aic_bic(best_ll, n_params, n_obs)
-
     return {
         "model": best_model,
+        "scaler_mean": mean,
+        "scaler_std": std,
+        "log_likelihood": float(best_ll),
+        "n_features": int(n_features),
+        "converged": bool(best_model.monitor_.converged),
+    }
+
+
+def fit_regimes(features: pd.DataFrame, n_states: int, config: RegimeConfig) -> dict[str, Any]:
+    """Fit a GaussianHMM with `n_states` and decode the regime sequence (single-fit).
+
+    The Level 1 diagnostic path: fit on the full `features` and Viterbi-decode the
+    same rows. This is in-sample BY DESIGN for characterization; the Level 2
+    backtest uses walk-forward labeling instead (see `backtest.py`).
+
+    Args:
+        features: raw feature DataFrame from `compute_features`.
+        n_states: number of HMM hidden states.
+        config: regime parameters.
+
+    Returns:
+        dict with keys: model (fitted GaussianHMM), states (np.ndarray of decoded
+        Viterbi states aligned positionally to `features`), index (the feature
+        DatetimeIndex), log_likelihood, n_params, aic, bic, n_states, converged,
+        scaler_mean, scaler_std.
+    """
+    fit = fit_model(features, n_states, config)
+    model = fit["model"]
+    x = _apply_scaler(features, fit["scaler_mean"], fit["scaler_std"])
+    states = model.predict(x)  # Viterbi most-likely state per bar
+    n_params = _hmm_n_params(n_states, fit["n_features"], config.covariance_type)
+    aic, bic = _aic_bic(fit["log_likelihood"], n_params, len(x))
+
+    return {
+        "model": model,
         "states": states,
         "index": features.index,
-        "log_likelihood": float(best_ll),
+        "log_likelihood": fit["log_likelihood"],
         "n_params": n_params,
         "aic": aic,
         "bic": bic,
         "n_states": n_states,
-        "converged": bool(best_model.monitor_.converged),
+        "converged": fit["converged"],
+        "scaler_mean": fit["scaler_mean"],
+        "scaler_std": fit["scaler_std"],
     }
 
 
