@@ -50,6 +50,8 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.data.load_kraken import build_dataset
 from src.env.trading_env import TradingEnv, EnvConfig
+from src.strategies.regime.backtest import RegimeBacktestConfig
+from src.strategies.regime.features import build_causal_regime_posteriors
 
 
 # ============================================================
@@ -114,6 +116,7 @@ def make_env(
     rank: int,
     monitor_dir: Optional[Path] = None,
     config: Optional[EnvConfig] = None,
+    regime_features: Optional[np.ndarray] = None,
 ):
     """Factory for a single env instance.
 
@@ -124,9 +127,13 @@ def make_env(
     Each parallel env gets a different RNG seed (seed + rank) so their
     episode starts diverge; otherwise n parallel rollouts would all sample
     the same episode and learning would be redundant.
+
+    `regime_features` (Level 3) is the causal per-bar posterior array aligned to
+    `data`; it is None (and ignored) unless the env config sets include_regime.
+    All parallel ranks share the same array - they differ only by episode-start seed.
     """
     def _init():
-        env = TradingEnv(data=data, config=config)
+        env = TradingEnv(data=data, config=config, regime_features=regime_features)
         env.reset(seed=seed + rank)
         if monitor_dir is not None:
             monitor_dir.mkdir(parents=True, exist_ok=True)
@@ -141,10 +148,12 @@ def make_vec_env(
     seed: int,
     monitor_dir: Optional[Path] = None,
     config: Optional[EnvConfig] = None,
+    regime_features: Optional[np.ndarray] = None,
 ) -> DummyVecEnv:
     """Build a vectorized env with `n_envs` parallel instances."""
     return DummyVecEnv([
-        make_env(data, seed, i, monitor_dir, config) for i in range(n_envs)
+        make_env(data, seed, i, monitor_dir, config, regime_features)
+        for i in range(n_envs)
     ])
 
 
@@ -214,8 +223,14 @@ def save_run_config(
     args: argparse.Namespace,
     train_n: int,
     val_n: int,
+    regime_n_states: int | None = None,
 ) -> None:
-    """Persist the exact configuration used. Lets you reproduce a run later."""
+    """Persist the exact configuration used. Lets you reproduce a run later.
+
+    `include_regime` and the regime state count are recorded for the Level 3
+    baseline-vs-augmented comparison. `getattr` keeps this backward-compatible with
+    callers whose args predate the flag.
+    """
     config = {
         "timesteps": args.timesteps,
         "n_envs": args.n_envs,
@@ -230,6 +245,8 @@ def save_run_config(
         "eval_freq": args.eval_freq,
         "run_id": args.run_id,
         "net_arch": args.net_arch,
+        "include_regime": getattr(args, "include_regime", False),
+        "regime_n_states": regime_n_states,
         "timestamp": datetime.now().isoformat(),
     }
     config_path = model_dir / "run_config.json"
@@ -272,6 +289,31 @@ def train(args: argparse.Namespace) -> None:
         val_fraction=args.val_fraction,
     )
 
+    # 1b. Optional Level 3 regime feature. Built on the FULL dataset (so warmup and
+    # walk-forward refits see contiguous history), then split at the SAME index as
+    # the data - each posterior[t] uses only data <= t-1, so a chronological split
+    # preserves causality. Baseline (no flag) leaves these None: env behavior and
+    # the observation space are byte-identical to before.
+    train_regime = val_regime = None
+    regime_n_states = None
+    if getattr(args, "include_regime", False):
+        full_df = build_dataset(start=args.data_start, end=args.data_end)
+        if len(full_df) != len(train_data) + len(val_data):
+            raise RuntimeError(
+                "Regime posterior alignment failed: full dataset length "
+                f"{len(full_df)} != train+val {len(train_data) + len(val_data)}."
+            )
+        split_idx = len(train_data)  # chronological head split, identical index
+        regime_cfg = RegimeBacktestConfig(
+            symbol="PF_XBTUSD", resolution="4h", n_states=args.regime_n_states,
+        )
+        logger.info("Building causal regime posteriors (walk-forward; may take minutes)...")
+        posteriors, regime_n_states = build_causal_regime_posteriors(full_df, regime_cfg)
+        train_regime = posteriors[:split_idx]
+        val_regime = posteriors[split_idx:]
+        logger.info("Regime feature ON: n_states=%d (regime obs columns appended).",
+                    regime_n_states)
+
     # Sanity: ensure both slices can construct their respective envs
     # Train uses default EnvConfig (episode 360); val uses shortened episode.
     train_min_bars = 600
@@ -288,17 +330,26 @@ def train(args: argparse.Namespace) -> None:
         )
 
     # 2. Save run config early (so a crash still leaves the metadata)
-    save_run_config(model_dir, args, len(train_data), len(val_data))
+    save_run_config(model_dir, args, len(train_data), len(val_data),
+                    regime_n_states=regime_n_states)
 
-    # 3. Build envs
+    # 3. Build envs. include_regime flows into BOTH train and val env configs so
+    # the observation space matches the (optional) appended regime posterior.
+    include_regime = getattr(args, "include_regime", False)
     monitor_dir = log_dir / "monitor"
-    train_env = make_vec_env(train_data, args.n_envs, args.seed, monitor_dir)
+    train_config = EnvConfig(include_regime=include_regime)
+    train_env = make_vec_env(
+        train_data, args.n_envs, args.seed, monitor_dir,
+        config=train_config, regime_features=train_regime,
+    )
 
     # Val env uses a separate EnvConfig with shorter episodes so the smaller
     # val data slice can fit multiple evaluation episodes.
-    val_config = EnvConfig(episode_length=args.val_episode_length)
+    val_config = EnvConfig(episode_length=args.val_episode_length,
+                           include_regime=include_regime)
     val_env = make_vec_env(
         val_data, n_envs=1, seed=args.seed + 1000, config=val_config,
+        regime_features=val_regime,
     )
 
     # 4. Build the model
@@ -392,6 +443,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Comma-separated hidden layer sizes, e.g. '32,32' or '64,64,64'")
     parser.add_argument("--run-id", type=str, default=None,
                         help="Optional run ID (default: auto-generated timestamp)")
+    parser.add_argument("--include-regime", action="store_true",
+                        help="Append the causal walk-forward regime posterior to the "
+                             "observation (Level 3). Default off = baseline.")
+    parser.add_argument("--regime-n-states", type=int, default=None,
+                        help="Force the regime count for --include-regime "
+                             "(default: auto-select via AIC/BIC).")
     return parser.parse_args(argv)
 
 

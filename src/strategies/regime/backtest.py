@@ -176,23 +176,30 @@ def _favorability_map(char: dict[str, Any], rule_name: str) -> dict[int, bool]:
 # Walk-forward regime labeling (reusable by a future scanner)
 # ============================================================
 
-def assign_regimes_walk_forward(
-    features: pd.DataFrame, config: RegimeBacktestConfig
+def _walk_forward_per_bar(
+    features: pd.DataFrame,
+    config: RegimeBacktestConfig,
+    decode: "Callable[..., Any]",
+    on_refit: "Callable[..., Any] | None" = None,
 ) -> dict[str, Any]:
-    """Assign a regime + favorability to each bar using ONLY its past.
+    """Shared causal walk-forward skeleton over `features`.
 
-    Expanding-window HMM, refit every `config.refit_every` bars starting at
-    `config.min_train_bars`. Between refits, each bar t is labeled by decoding the
-    observations from the refit boundary through t (standardized with the training
-    scaler) and taking the last state - strictly causal (data <= t only).
+    Expanding-window HMM, refit every `config.refit_every` bars from
+    `config.min_train_bars`. `n_states` is selected ONCE from the first training
+    window (past data only) when `config.n_states is None`, then held fixed. Each
+    bar t is handed to `decode` with its refit boundary, model and scaler; `decode`
+    must only look at features[i:t+1] (data <= t) so the result stays causal. The
+    hard-label and soft-posterior paths both build on this, so they can never
+    diverge on the refit/scaler/selection discipline.
+
+    Args:
+        decode: (refit_ctx, model, mean, std, features, i, t) -> per-bar value.
+        on_refit: optional (train, model, mean, std) -> refit_ctx, computed once
+            per refit and passed to `decode` (e.g. the hard path's favorability map).
 
     Returns:
-        dict with:
-          labels: DataFrame indexed by the labeled bars, columns
-              [regime, favorable, fit_train_end] (fit_train_end = the boundary bar
-              index whose fit labeled this row).
-          n_refits: number of HMM refits performed.
-          n_states: the (selected or configured) state count used.
+        dict: values (list aligned to features rows; None on warmup bars),
+        mask (bool array of labeled rows), n_states, n_refits.
     """
     rc = _regime_config(config)
     n = len(features)
@@ -202,9 +209,6 @@ def assign_regimes_walk_forward(
             f"{config.min_train_bars}; need more history."
         )
 
-    # Structural choice: select n_states ONCE from the first training window (past
-    # data only), then hold it fixed. Selecting per-asset satisfies the "no
-    # hardcoded 4" requirement without re-selecting (and re-look-ahead-ing) each bar.
     first_train = features.iloc[: config.min_train_bars]
     if config.n_states is None:
         n_states = int(select_n_states(first_train, rc)["bic_preferred"])
@@ -213,9 +217,8 @@ def assign_regimes_walk_forward(
     else:
         n_states = int(config.n_states)
 
-    regime = np.full(n, -1, dtype=int)          # -1 = warmup / unlabeled
-    favorable = np.zeros(n, dtype=bool)
-    fit_train_end = np.full(n, -1, dtype=int)
+    values: list[Any] = [None] * n
+    mask = np.zeros(n, dtype=bool)
 
     n_refits = 0
     i = config.min_train_bars
@@ -225,33 +228,91 @@ def assign_regimes_walk_forward(
         n_refits += 1
         model = fit["model"]
         mean, std = fit["scaler_mean"], fit["scaler_std"]
-
-        # Favorability from THIS fit's characterization of its training window -
-        # the regime properties known at decision time (not full-sample).
-        train_states = model.predict(_apply_scaler(train, mean, std))
-        char = characterize_regimes(train, train_states, train, rc,
-                                    transition_matrix=model.transmat_)
-        fav_map = _favorability_map(char, config.favorable_regime_rule)
+        refit_ctx = on_refit(train, model, mean, std) if on_refit is not None else None
 
         block_end = min(i + config.refit_every, n)
         for t in range(i, block_end):
-            # Causal decode: standardize [i:t+1] with the TRAIN scaler, Viterbi,
-            # take the last state. Only bars <= t enter this computation.
-            window = features.iloc[i:t + 1]
-            x_win = _apply_scaler(window, mean, std)
-            s = int(model.predict(x_win)[-1])
-            regime[t] = s
-            favorable[t] = fav_map.get(s, False)
-            fit_train_end[t] = i
+            values[t] = decode(refit_ctx, model, mean, std, features, i, t)
+            mask[t] = True
         i = block_end
 
-    mask = regime >= 0
+    return {"values": values, "mask": mask, "n_states": n_states, "n_refits": n_refits}
+
+
+def assign_regimes_walk_forward(
+    features: pd.DataFrame, config: RegimeBacktestConfig
+) -> dict[str, Any]:
+    """Assign a hard regime label + favorability to each bar using ONLY its past.
+
+    Expanding-window HMM (see `_walk_forward_per_bar`); each bar t is Viterbi-
+    decoded over features[i:t+1] and takes the last state - strictly causal
+    (data <= t only). Favorability comes from each fit's characterization of its
+    OWN training window (regime properties known at decision time, not full-sample).
+
+    Returns:
+        dict with:
+          labels: DataFrame indexed by the labeled bars, columns
+              [regime, favorable, fit_train_end].
+          n_refits: number of HMM refits performed.
+          n_states: the (selected or configured) state count used.
+    """
+    def on_refit(train, model, mean, std):
+        train_states = model.predict(_apply_scaler(train, mean, std))
+        char = characterize_regimes(train, train_states, train, _regime_config(config),
+                                    transition_matrix=model.transmat_)
+        return {"fav_map": _favorability_map(char, config.favorable_regime_rule),
+                "train_end": len(train)}
+
+    def decode(refit_ctx, model, mean, std, feats, i, t):
+        window = feats.iloc[i:t + 1]  # only bars <= t
+        s = int(model.predict(_apply_scaler(window, mean, std))[-1])
+        return (s, bool(refit_ctx["fav_map"].get(s, False)), refit_ctx["train_end"])
+
+    wf = _walk_forward_per_bar(features, config, decode, on_refit=on_refit)
+    mask = wf["mask"]
+    rows = [(v[0], v[1], v[2]) for v, m in zip(wf["values"], mask) if m]
     labels = pd.DataFrame(
-        {"regime": regime[mask], "favorable": favorable[mask],
-         "fit_train_end": fit_train_end[mask]},
+        rows, columns=["regime", "favorable", "fit_train_end"],
         index=features.index[mask],
     )
-    return {"labels": labels, "n_refits": n_refits, "n_states": n_states}
+    labels["regime"] = labels["regime"].astype(int)
+    labels["favorable"] = labels["favorable"].astype(bool)
+    return {"labels": labels, "n_refits": wf["n_refits"], "n_states": wf["n_states"]}
+
+
+def assign_regime_posteriors_walk_forward(
+    features: pd.DataFrame, config: RegimeBacktestConfig
+) -> dict[str, Any]:
+    """Emit the causal SOFT regime posterior per bar (Level 3), using ONLY its past.
+
+    Same walk-forward discipline as `assign_regimes_walk_forward`, but each bar t
+    gets the HMM filtered posterior over states rather than a hard label. We run
+    `predict_proba` over the causal window features[i:t+1] and take the LAST row:
+    at the final position of a sequence the forward-backward marginal reduces to
+    the FILTERED posterior P(state_t | obs[i..t]) - i.e. it uses no data after t.
+    This is the soft analogue of taking the last Viterbi state, and is causal by
+    the same argument.
+
+    Returns:
+        dict with:
+          posteriors: DataFrame indexed by labeled bars, columns p_state_0.. (one
+              per regime), each row a probability distribution over states.
+          n_states, n_refits.
+    """
+    def decode(refit_ctx, model, mean, std, feats, i, t):
+        window = feats.iloc[i:t + 1]  # only bars <= t
+        # predict_proba(window)[-1] == filtered posterior at t (beta_T == 1).
+        return model.predict_proba(_apply_scaler(window, mean, std))[-1]
+
+    wf = _walk_forward_per_bar(features, config, decode)
+    mask = wf["mask"]
+    n_states = wf["n_states"]
+    post = np.vstack([v for v, m in zip(wf["values"], mask) if m])
+    posteriors = pd.DataFrame(
+        post, index=features.index[mask],
+        columns=[f"p_state_{j}" for j in range(n_states)],
+    )
+    return {"posteriors": posteriors, "n_states": n_states, "n_refits": wf["n_refits"]}
 
 
 # ============================================================
