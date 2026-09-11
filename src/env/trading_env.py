@@ -82,6 +82,10 @@ class EnvConfig:
 
     # Optional features
     include_calendar: bool = True
+    # Regime state feature (Level 3). When True, the observation is extended by the
+    # per-bar causal regime posterior supplied to the env constructor. When False
+    # (default), the env is byte-identical to the pre-regime version.
+    include_regime: bool = False
 
     def __post_init__(self) -> None:
         assert self.episode_length > 0
@@ -160,6 +164,7 @@ class TradingEnv(gym.Env):
         data: pd.DataFrame,
         config: EnvConfig | None = None,
         render_mode: str | None = None,
+        regime_features: np.ndarray | None = None,
     ):
         super().__init__()
         self.config = config or EnvConfig()
@@ -168,6 +173,37 @@ class TradingEnv(gym.Env):
         # Validate and stash data
         self._validate_data(data)
         self.data = data.copy()
+
+        # Optional regime state feature (Level 3). The supplied array is the
+        # per-bar regime posterior aligned POSITIONALLY to `data`. It is expected
+        # to already be CAUSAL and one-bar-LAGGED (built upstream by
+        # src/strategies/regime/features.build_causal_regime_posteriors): row t is
+        # the posterior known as of bar t-1, using only data <= t-1. The env does
+        # NOT compute or lag regimes itself - it just reads this array - so there is
+        # no way for a look-ahead bug to enter here; causality is guaranteed by the
+        # builder. Must be set before `_observation_dim()` is used below.
+        if self.config.include_regime:
+            if regime_features is None:
+                raise ValueError(
+                    "include_regime=True requires `regime_features` (the causal, "
+                    "one-bar-lagged per-bar regime posterior array)."
+                )
+            regime_features = np.asarray(regime_features, dtype=np.float32)
+            if regime_features.ndim != 2:
+                raise ValueError(
+                    f"regime_features must be 2D [n_bars, n_states]; got shape "
+                    f"{regime_features.shape}."
+                )
+            if len(regime_features) != len(self.data):
+                raise ValueError(
+                    f"regime_features length {len(regime_features)} != data length "
+                    f"{len(self.data)}; the posterior array must align to every bar."
+                )
+            self._regime_features = regime_features
+            self._n_regime_features = int(regime_features.shape[1])
+        else:
+            self._regime_features = None
+            self._n_regime_features = 0
 
         # Precompute every feature for the whole dataset (one-time cost)
         self._precompute_features()
@@ -288,7 +324,11 @@ class TradingEnv(gym.Env):
 
     def _observation_dim(self) -> int:
         cfg = self.config
-        return cfg.n_return_lags + 5 + 3 + (4 if cfg.include_calendar else 0)
+        # base = 12 lags + 5 tech + 3 portfolio + 4 calendar; regime posterior (if
+        # enabled) is appended last, adding one column per regime state.
+        return (cfg.n_return_lags + 5 + 3
+                + (4 if cfg.include_calendar else 0)
+                + self._n_regime_features)
 
     # --------------------------------------------------------
     # Gymnasium API
@@ -431,7 +471,14 @@ class TradingEnv(gym.Env):
         steps_log = float(np.log1p(self._steps_in_position))
         portfolio = [pos, pnl_pct, steps_log]
 
-        obs = np.array(lag_returns + tech + portfolio + cal, dtype=np.float32)
+        # Regime posterior (Level 3) appended last, when enabled. Read straight from
+        # the pre-lagged causal array at the current bar - no computation here.
+        if self._n_regime_features > 0:
+            regime = [float(v) for v in self._regime_features[idx]]
+        else:
+            regime = []
+
+        obs = np.array(lag_returns + tech + portfolio + cal + regime, dtype=np.float32)
 
         # Safety net: any NaN/Inf becomes 0. Should not happen given
         # _min_start_idx guard, but defends against unexpected data quirks.
