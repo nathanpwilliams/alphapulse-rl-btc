@@ -334,3 +334,77 @@ multi-asset recurring scanner becomes the infrastructure build. If not, regimes 
 real-but-not-exploitable-this-way and we reconsider the filter design.
 
 ---
+## 2026-09-10 — Level 3: regime as a causal RL state feature (baseline vs augmented)
+
+**Status:** Tested whether feeding the causal regime posterior to the PPO agent as a
+state feature improves generalization vs a no-regime baseline — the intended
+application of the regime work and the direct fix for the original single-policy
+overfitting. Both runs identical except the regime feature.
+
+### What I did
+
+Added include_regime to EnvConfig (off by default; baseline behavior byte-identical).
+Built src/strategies/regime/features.py: causal walk-forward HMM posteriors (soft
+state probabilities) per bar, reusing Level 2's walk-forward machinery (train-window
+scaler, refit cadence, one-bar lag) so no future info enters the state. Refactored the
+Level 2 walk-forward into a shared causal skeleton (`_walk_forward_per_bar`) so the
+hard-label and new soft-posterior paths cannot diverge; the soft path takes
+`predict_proba(window)[-1]`, which at a sequence's final position is the FILTERED
+(causal) posterior. Wired --include-regime into training. Ran L3_baseline (no regime)
+and L3_regime (regime posterior appended) — identical timesteps/envs/seed/net-arch/data
+(500K, 8 envs, seed 42, [32,32], 2022-04-01→2026-08-01, 7,123 train / 2,375 val bars),
+only the feature differs. 17 new tests; look-ahead and lag guards non-negotiable.
+
+n_states auto-selected = 4 (BIC, walk-forward on the first 1,500 bars) — agreeing with
+Level 1's full-sample finding. ~7,986 / 9,498 bars carried a genuine lagged causal
+posterior; the rest (feature warmup + pre-first-fit window + the first labeled bar) got
+a neutral uniform posterior.
+
+### What the comparison showed
+
+| Metric | Baseline (no regime) | Regime-augmented |
+| --- | --- | --- |
+| Final train reward (rollout/ep_rew_mean) | +0.0817 | +0.2126 |
+| Final val reward (eval/mean_reward) | -0.0459 | -0.0837 |
+| Peak val reward | +0.0097 (410K) | +0.0078 (450K) |
+| Final explained_variance | +0.080 | +0.045 |
+| Train/val gap (final) | 0.127 | 0.296 |
+
+The regime feature INCREASED the train/val gap (~0.13 → ~0.30): training reward jumped
+markedly (+0.08 → +0.21) while final validation reward got worse (-0.046 → -0.084) and
+peak validation was marginally lower. Numbers only, no verdict.
+
+### What I learned
+
+- Adding the 4-dim regime posterior gave the policy extra input capacity, which on this
+  data-limited problem it spent memorizing the training period rather than
+  generalizing: train reward nearly tripled while val degraded. This is the
+  "more input dims = more overfit capacity on limited data" outcome flagged as a real
+  possibility — consistent with the standing finding that data volume, not features or
+  architecture, is the binding constraint.
+- Crucially, the augmented agent looked WORSE on validation, not suspiciously better —
+  exactly the signature expected when there is NO look-ahead leak. A regime feature that
+  leaked the future would have inflated validation reward; instead the honest causal
+  walk-forward + one-bar lag (guarded by the non-negotiable no-look-ahead/lag tests)
+  produced a feature that simply didn't help. That the result is unimpressive is itself
+  evidence the causality is clean.
+- The soft posterior's causality rests on a clean property: the forward-backward
+  marginal at a sequence's last position equals the filtered posterior (beta_T = 1), so
+  `predict_proba(window)[-1]` uses no data beyond the window end. This let the soft path
+  reuse the exact refit/scaler skeleton of the hard path.
+- Cost: the causal posterior precompute (walk-forward, 45 refits, per-bar predict_proba)
+  ran ~4.4 min on the full history — the same order as Level 2. Each 500K PPO run was
+  ~2.3 min; the regime run's only added cost is the one-time precompute.
+- Env plumbing stayed clean: with include_regime=False the observation space and all
+  existing env tests are byte-identical; the regime columns are appended last and read
+  straight from the pre-lagged array, so the env cannot introduce look-ahead.
+
+### What's next
+
+Interpretation with the lead. Per prior agreement this is the last regime experiment
+before a strategic reassessment: if the regime feature improves generalization, the
+regime work becomes central (regime-conditional RL + the multi-asset scanner); if not,
+BTC 4H regime structure — though real — doesn't convert to edge with these tools, and
+the arena itself gets reconsidered.
+
+---
