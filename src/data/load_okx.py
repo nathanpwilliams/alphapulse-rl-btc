@@ -259,6 +259,147 @@ def fetch_okx_funding_rates(
 
 
 # ============================================================
+# OHLCV candle fetching (for cross-venue price analysis)
+# ============================================================
+
+# History-candles serves older data AND recent bars (newest-first, paginated
+# backward via the `after` cursor). Max 100 rows/request.
+OKX_HISTORY_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
+OKX_CANDLE_LIMIT = 100
+
+# Cap total candle-pagination requests. At 100 bars/request, 5m bars, 500 pages
+# ~= 50k bars ~= 170 days - far beyond the Phase A 3-4 week target.
+MAX_CANDLE_PAGES = 500
+
+
+def _fetch_okx_candle_page(inst_id: str, bar: str, after: int | None) -> list[list]:
+    """Fetch one page of candles, optionally older than `after` (ms epoch).
+
+    OKX candle rows are lists: [ts, open, high, low, close, vol, volCcy,
+    volCcyQuote, confirm] - all strings; `ts` is the bar-OPEN time in ms,
+    `confirm` is "1" for a closed bar and "0" for the in-progress one.
+    """
+    params: dict[str, str | int] = {"instId": inst_id, "bar": bar, "limit": OKX_CANDLE_LIMIT}
+    if after is not None:
+        params["after"] = after
+    data = _http_get_json(OKX_HISTORY_CANDLES_URL, params=params)
+    code = str(data.get("code", ""))
+    if code != "0":
+        raise ValueError(
+            f"OKX candles API error for {inst_id} {bar}: code={code!r} msg={data.get('msg')!r}"
+        )
+    if "data" not in data:
+        raise ValueError(f"Unexpected OKX candles response shape: keys={list(data.keys())}")
+    return data["data"]
+
+
+def _paginate_okx_candles(inst_id: str, bar: str, start_ms: int | None) -> list[list]:
+    """Page backwards through OKX candles until `start_ms` or the request cap."""
+    rows: list[list] = []
+    after: int | None = None  # None -> newest page first
+    for page_i in range(1, MAX_CANDLE_PAGES + 1):
+        page = _fetch_okx_candle_page(inst_id, bar, after)
+        if not page:
+            break
+        rows.extend(page)
+        oldest_ms = min(int(r[0]) for r in page)
+        if start_ms is not None and oldest_ms <= start_ms:
+            break
+        if len(page) < OKX_CANDLE_LIMIT:
+            break  # short page => reached the start of available history
+        after = oldest_ms
+        time.sleep(PER_REQUEST_DELAY_SEC)
+    else:
+        logger.warning(
+            "OKX candle pagination hit MAX_CANDLE_PAGES=%d; history TRUNCATED.",
+            MAX_CANDLE_PAGES,
+        )
+    return rows
+
+
+def _okx_candles_to_dataframe(rows: list[list]) -> pd.DataFrame:
+    """Convert raw OKX candle rows to a typed OHLCV DataFrame.
+
+    Keeps only CLOSED bars (confirm == "1") so a still-forming last candle never
+    contaminates the analysis. Indexed by bar-open UTC timestamp; columns
+    [open, high, low, close, volume].
+    """
+    # OKX history-candles rows have 9 fields; confirm is the last. Keep closed bars.
+    closed = [r for r in rows if len(r) < 9 or str(r[-1]) == "1"]
+    cols = ["ts", "open", "high", "low", "close", "volume", "volCcy", "volCcyQuote", "confirm"]
+    df = pd.DataFrame(closed, columns=cols[: len(closed[0])])
+    df["timestamp"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = df[col].astype(float)
+    df = df.set_index("timestamp").sort_index()
+    df = df[~df.index.duplicated(keep="first")]
+    return df[["open", "high", "low", "close", "volume"]]
+
+
+def _okx_candle_cache_path(
+    inst_id: str, bar: str, start_label: str, end_label: str, cache_dir: Path
+) -> Path:
+    """Deterministic cache filename for an OKX candle request."""
+    return cache_dir / f"okx_ohlcv_{inst_id}_{bar}_{start_label}_{end_label}.parquet"
+
+
+def fetch_okx_ohlcv(
+    inst_id: str,
+    bar: str = "5m",
+    start: str | None = None,
+    end: str | None = None,
+    cache_dir: Path | str = DEFAULT_CACHE_DIR,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """Fetch OKX candles for `inst_id` at `bar` resolution over [start, end).
+
+    Args:
+        inst_id: OKX instrument id, e.g. "BTC-USDT-SWAP".
+        bar: OKX bar size, e.g. "5m", "1H", "1D".
+        start, end: optional ISO date strings (UTC). `start` bounds how far back
+            pagination walks; `end` trims the tail.
+        cache_dir: Parquet cache directory.
+        force_refresh: refetch even if a cache file exists.
+
+    Returns:
+        DataFrame indexed by bar-open UTC timestamp with columns
+        [open, high, low, close, volume]. Only closed bars are included.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    start_ms = int(_to_utc(start).timestamp() * 1000) if start else None
+    end_dt = _to_utc(end) if end else None
+    start_label = start if start else "min"
+    end_label = end if end else "max"
+    cache_file = _okx_candle_cache_path(inst_id, bar, start_label, end_label, cache_dir)
+
+    if cache_file.exists() and not force_refresh:
+        logger.info("Loading cached OKX candles from %s", cache_file)
+        return pd.read_parquet(cache_file)
+
+    logger.info("Fetching OKX candles: %s %s", inst_id, bar)
+    rows = _paginate_okx_candles(inst_id, bar, start_ms)
+    if not rows:
+        raise ValueError(f"No OKX candles returned for {inst_id!r} {bar!r}")
+
+    df = _okx_candles_to_dataframe(rows)
+    if start:
+        df = df.loc[df.index >= _to_utc(start)]
+    if end_dt is not None:
+        df = df.loc[df.index < end_dt]
+    if df.empty:
+        raise ValueError(
+            f"OKX candles for {inst_id!r} {bar!r} empty after trimming to "
+            f"[{start_label}, {end_label}). Widen the range."
+        )
+
+    df.to_parquet(cache_file)
+    logger.info("Cached %d OKX candles to %s", len(df), cache_file)
+    return df
+
+
+# ============================================================
 # CLI smoke test
 # ============================================================
 

@@ -172,3 +172,75 @@ class TestOkxFetch:
         with patch.object(lo, "_http_get_json", return_value={"code": "0", "msg": "", "data": []}):
             with pytest.raises(ValueError, match="No OKX funding"):
                 lo.fetch_okx_funding_rates("BTC-USDT-SWAP", cache_dir=tmp_path)
+
+
+# ============================================================
+# OHLCV candle fetching
+# ============================================================
+
+def make_okx_candles(start_dt: datetime, n: int, price: float = 40000.0,
+                     bar_min: int = 5, confirm: str = "1") -> list[list]:
+    """Synthetic OKX candle rows (newest-first, as history-candles returns them)."""
+    rows = []
+    for i in range(n):
+        ts = start_dt + pd.Timedelta(minutes=bar_min * i)
+        p = price * (1.0 + 0.0001 * i)
+        rows.append([
+            str(int(ts.timestamp() * 1000)),
+            f"{p:.2f}", f"{p * 1.001:.2f}", f"{p * 0.999:.2f}", f"{p:.2f}",
+            "10.0", "400000.0", "400000.0", confirm,
+        ])
+    return list(reversed(rows))  # API returns newest-first
+
+
+class TestOkxCandles:
+
+    def test_parses_candle_shape(self):
+        rows = make_okx_candles(datetime(2024, 1, 1, tzinfo=timezone.utc), n=10)
+        df = lo._okx_candles_to_dataframe(rows)
+        assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+        assert isinstance(df.index, pd.DatetimeIndex)
+        assert str(df.index.tz) == "UTC"
+        assert len(df) == 10
+        assert df.index.is_monotonic_increasing
+        assert df["close"].iloc[0] == pytest.approx(40000.0)
+
+    def test_unconfirmed_bars_dropped(self):
+        base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        closed = make_okx_candles(base, n=5)
+        # Prepend an in-progress (confirm="0") most-recent bar.
+        live = make_okx_candles(base + pd.Timedelta(minutes=25), n=1, confirm="0")
+        df = lo._okx_candles_to_dataframe(live + closed)
+        assert len(df) == 5  # the confirm="0" bar is excluded
+
+    def test_fetch_paginates_and_caches(self, tmp_path):
+        base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        rows = make_okx_candles(base, n=50, bar_min=5)  # < 100 -> single page
+
+        with patch.object(lo, "_http_get_json", return_value={"code": "0", "msg": "", "data": rows}):
+            df = lo.fetch_okx_ohlcv("BTC-USDT-SWAP", bar="5m", cache_dir=tmp_path)
+
+        assert len(df) == 50
+        assert any(tmp_path.glob("okx_ohlcv_*.parquet"))
+
+    def test_candle_api_error_raises(self):
+        with patch.object(lo, "_http_get_json", return_value={"code": "50011", "msg": "x", "data": []}):
+            with pytest.raises(ValueError, match="OKX candles API error"):
+                lo._fetch_okx_candle_page("BTC-USDT-SWAP", "5m", after=None)
+
+    def test_candle_pagination_walks_backward(self, tmp_path):
+        """Two full pages then a short page: cursor advances via `after`."""
+        base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        page1 = make_okx_candles(base + pd.Timedelta(minutes=5 * 100), n=100)  # newest
+        page2 = make_okx_candles(base, n=40)  # older, short -> ends pagination
+
+        calls = {"n": 0}
+        def fake(url, params=None):
+            calls["n"] += 1
+            return {"code": "0", "msg": "", "data": page1 if calls["n"] == 1 else page2}
+
+        with patch.object(lo, "_http_get_json", side_effect=fake):
+            df = lo.fetch_okx_ohlcv("BTC-USDT-SWAP", bar="5m", cache_dir=tmp_path)
+        assert calls["n"] == 2
+        assert len(df) == 140
+        assert df.index.is_monotonic_increasing
