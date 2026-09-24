@@ -85,6 +85,7 @@ api_keys.txt
 data/raw/
 data/processed/
 data/cache/
+data/tob/
 
 # But DO commit small test fixtures (whitelisted explicitly via negation)
 !tests/fixtures/

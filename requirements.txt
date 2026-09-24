@@ -26,6 +26,9 @@ matplotlib>=3.7,<4
 requests>=2.31,<3
 python-dotenv>=1.0,<2
 
+# --- Live websocket collection (Phase B top-of-book collector) ---
+websockets>=12,<16
+
 # --- Testing ---
 pytest>=7.4,<9
 pytest-cov>=4.1,<6
