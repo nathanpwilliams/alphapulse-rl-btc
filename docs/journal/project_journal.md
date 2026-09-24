@@ -408,3 +408,53 @@ BTC 4H regime structure — though real — doesn't convert to edge with these t
 the arena itself gets reconsidered.
 
 ---
+## 2026-09-24 — Pivot: cross-venue price dislocation scanner (Phase A, multi-asset)
+
+**Status:** After four BTC-4H strategies (RL directional, funding arb, regime filter,
+regime-conditional RL) failed to beat buy-and-hold — common cause: efficient,
+data-limited arena plus predictive edges — pivoted to a STRUCTURAL edge in a LESS-
+EFFICIENT arena: cross-venue (Kraken Futures vs OKX) price dislocation across a basket
+of alts at 5m, with BTC/ETH as efficient-market controls. Built the Phase A screen.
+
+### What I did
+
+Probed both venues first: 173 shared base assets; Kraken Futures perps are USD-quoted,
+OKX USDT-quoted, so same-quote pairing is infeasible — compared USD vs USDT and let the
+basis ride as a structural premium the analyzer separates from transient dislocation.
+Basket: BTC, ETH (controls) + SOL, XRP, DOGE, LTC, NEAR, UNI, SUI, ARB (~$1.2B → ~$0.1B
+24h notional). 5m depth: 30d used (Kraken 35d gap-free via the paginating loader; OKX
+≥31d). Added fetch_okx_ohlcv, load_cross_venue_basket, and
+src/strategies/dislocation/scanner.py: tight-tolerance alignment with no forward-fill,
+gap stats, structural premium (signed mean + sign stability), excursions above cost on
+raw AND mean-removed gap, AR(1) half-life, cross-asset table. 18 tests; 196 total.
+
+### What the scan showed (30d, 5m, 20 bps hurdle)
+
+Controls clean: BTC/ETH ~0.1 transient excursions/day, mean |gap| ~3 bps, half-life
+18–34 min. Alts show a monotonic liquidity gradient: UNI 7.4, NEAR 17.9, ARB 41.9
+transient excursions/day; ARB mean |gap| 15.5 bps, p95 38.5 bps, half-life 1.6 min.
+Structural premium positive on every asset and rising with illiquidity (BTC +2.4 →
+ARB +9.4 bps).
+
+### What I learned
+
+- The screen behaves as theory predicts: no exploitable gap where the market is
+  efficient, rising dislocation as liquidity thins. First positive-direction
+  confirmation in the project.
+- Three reasons the candle result cannot yet be believed: (1) ARB's 1.6-min half-life
+  is shorter than the 5m sampling interval, so most of an excursion reverts between
+  observations; (2) candle closes are last-trade prints, which go stale on thin books
+  and create phantom gaps; (3) the 20 bps hurdle assumes a spread the candles can't see,
+  and thin alt perps may have 10–20 bps spreads each side. All three are resolved only by
+  bid/ask quotes.
+- The USD/USDT quote mismatch shows up as a ~2.4 bps constant on BTC; the larger alt
+  premia are venue friction/staleness, correctly excluded from transient counts.
+
+### What's next
+
+Phase B: live top-of-book collection (public websockets, both venues) for ARB, NEAR,
+UNI + BTC control over ~5–7 days, then recompute EXECUTABLE gaps (bid on one venue vs
+ask on the other, net of fees) and rerun the excursion analysis. Candidates are
+believed only if executable excursions survive.
+
+---
