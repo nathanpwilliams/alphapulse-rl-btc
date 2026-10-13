@@ -189,8 +189,22 @@ systemctl disable --now alphapulse-tob
 kill $(cat /opt/alphapulse-rl-btc/logs/tob_collector.pid)   # graceful; final flush runs
 ```
 
-`SIGTERM` unwinds `run_collector`'s `finally` block, which flushes whatever is still
-buffered — so a `systemctl stop` loses at most the in-flight rows, not the file.
+`run_collector` installs an asyncio handler for `SIGTERM`/`SIGINT` that sets a stop
+event, so the `finally` block runs and flushes whatever is still buffered — a
+`systemctl stop` loses at most the rows that arrived in the same event-loop tick, not
+the file. Confirm the flush in the journal:
+
+```bash
+journalctl -u alphapulse-tob -n 5 --no-pager | grep "final flush complete"
+# expect: "Collector stopped; final flush complete (N quote rows, M events)."
+```
+
+**If that line is absent, the buffer since the last periodic flush was lost.** Python's
+*default* `SIGTERM` action terminates the interpreter immediately — no `finally`, no
+flush. The collector ran without the handler until 2026-10-13 and the Phase B shutdown
+lost ~200 rows (~2.3 s) that way; harmless against 71.5M rows, but silent. If you ever
+run a build predating the handler, stop it with `SIGINT` instead (`kill -INT <pid>`),
+which raises `KeyboardInterrupt` and does unwind.
 
 ---
 

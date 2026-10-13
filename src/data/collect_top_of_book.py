@@ -26,6 +26,9 @@ Design:
       market.
     * Auto-reconnect with exponential backoff; OKX app-level ping; a recv timeout
       is treated as a dead connection and triggers reconnect.
+    * Graceful shutdown: SIGTERM/SIGINT set a stop event so the final flush runs.
+      Python's DEFAULT SIGTERM action kills the interpreter outright, skipping
+      every `finally` -- and `systemctl stop` sends SIGTERM.
 
 Run (long-lived; see docs/tob_collector_runbook.md for droplet deployment):
     python -m src.data.collect_top_of_book --symbols ARB,NEAR,UNI,BTC --out data/tob/
@@ -39,6 +42,7 @@ import asyncio
 import csv
 import json
 import logging
+import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -292,28 +296,91 @@ async def _writer(config: CollectorConfig, buffer: list, events: list) -> None:
             append_rows(evs, config.out_dir, "tob_events", EVENT_COLUMNS)
 
 
+SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+def _install_shutdown_handlers(
+    loop: asyncio.AbstractEventLoop, stop: asyncio.Event
+) -> list[signal.Signals]:
+    """Make SIGTERM/SIGINT set `stop` instead of killing the process.
+
+    Python's DEFAULT SIGTERM action terminates the interpreter immediately: no
+    `finally` blocks, no final flush. `systemctl stop` sends exactly that, so
+    without this the buffered rows since the last periodic flush are lost (this
+    cost ~200 rows when the Phase B collector was stopped on 2026-10-13).
+
+    Returns the signals actually installed, so they can be restored afterwards.
+    `add_signal_handler` is unavailable on some platforms (Windows) and outside
+    the main thread; there we leave the default action rather than fail.
+    """
+    installed: list[signal.Signals] = []
+    for sig in SHUTDOWN_SIGNALS:
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+            logger.warning("Cannot install %s handler; final flush not guaranteed.", sig.name)
+            continue
+        installed.append(sig)
+    return installed
+
+
+def _remove_shutdown_handlers(
+    loop: asyncio.AbstractEventLoop, installed: list[signal.Signals]
+) -> None:
+    """Restore the default disposition of every handler we installed."""
+    for sig in installed:
+        try:
+            loop.remove_signal_handler(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+
 async def run_collector(config: CollectorConfig) -> None:
-    """Run both feeds + writer until duration elapses (0 = forever)."""
+    """Run both feeds + writer until duration elapses (0 = forever) or a signal.
+
+    Stops on whichever comes first: `config.duration_sec` elapsing, SIGTERM or
+    SIGINT, or (in forever mode) a feed task raising. In every case the `finally`
+    block runs and flushes whatever is still buffered, so at most the in-flight
+    rows are lost -- never the file.
+    """
     buffer: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    installed = _install_shutdown_handlers(loop, stop)
+
     tasks = [
         asyncio.create_task(_kraken_feed(config, buffer, events)),
         asyncio.create_task(_okx_feed(config, buffer, events)),
         asyncio.create_task(_writer(config, buffer, events)),
     ]
+    stop_task = asyncio.create_task(stop.wait())
+    waiters = [stop_task]
+    if config.duration_sec > 0:
+        waiters.append(asyncio.create_task(asyncio.sleep(config.duration_sec)))
+    else:
+        # Forever mode: a dying feed must surface, as `gather` used to make it.
+        waiters.extend(tasks)
+
     try:
-        if config.duration_sec > 0:
-            await asyncio.sleep(config.duration_sec)
-        else:
-            await asyncio.gather(*tasks)
-    finally:
+        done, _pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        if stop_task in done:
+            logger.info("Shutdown signal received; draining buffers.")
         for t in tasks:
+            if t in done:
+                t.result()  # re-raise a feed's exception, as before
+    finally:
+        _remove_shutdown_handlers(loop, installed)
+        pending = set(tasks) | set(waiters)
+        for t in pending:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*pending, return_exceptions=True)
         # Final flush of anything still buffered.
+        n_quotes, n_events = len(buffer), len(events)
         append_rows(buffer, config.out_dir, "tob", TOB_COLUMNS)
         append_rows(events, config.out_dir, "tob_events", EVENT_COLUMNS)
-        logger.info("Collector stopped; final flush complete.")
+        logger.info("Collector stopped; final flush complete (%d quote rows, %d events).",
+                    n_quotes, n_events)
 
 
 # ============================================================

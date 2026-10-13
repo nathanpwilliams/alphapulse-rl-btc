@@ -11,6 +11,9 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -145,3 +148,148 @@ class TestAppendRows:
     def test_empty_rows_noop(self, tmp_path):
         c.append_rows([], tmp_path, "tob", c.TOB_COLUMNS)
         assert list(tmp_path.glob("*.csv")) == []
+
+
+# ============================================================
+# Graceful shutdown / final flush
+# ============================================================
+#
+# `systemctl stop` sends SIGTERM, whose DEFAULT action kills the interpreter
+# outright -- no `finally`, no final flush. The Phase B run lost ~200 buffered
+# rows that way on 2026-10-13. Every test here sets `flush_interval_sec` far
+# longer than the test runs, so the periodic writer can NEVER fire: if rows
+# appear on disk, only the final flush in `run_collector`'s `finally` put them
+# there.
+
+def _quote_row(ts_ms: int = 1704067200000, asset: str = "BTC") -> dict:
+    return {"ts_recv": ts_ms, "ts_exchange": ts_ms - 20, "venue": "kraken",
+            "asset": asset, "bid": 1.0, "bid_size": 2.0, "ask": 1.1, "ask_size": 3.0}
+
+
+def _buffering_feed(rows, event_detail="stub"):
+    """A feed stub that buffers `rows` once, then idles forever."""
+    async def feed(config, buffer, events):
+        buffer.extend(rows)
+        events.append({"ts_recv": rows[0]["ts_recv"], "venue": "kraken", "asset": "*",
+                       "event": "connected", "detail": event_detail})
+        while True:
+            await asyncio.sleep(3600)
+    return feed
+
+
+async def _idle_feed(config, buffer, events):
+    while True:
+        await asyncio.sleep(3600)
+
+
+def _run_with_signal(config, sig, delay=0.05):
+    """Run the collector and deliver `sig` to our own process from the loop."""
+    async def driver():
+        loop = asyncio.get_running_loop()
+        loop.call_later(delay, os.kill, os.getpid(), sig)
+        await c.run_collector(config)
+    asyncio.run(driver())
+
+
+class TestGracefulShutdown:
+
+    @pytest.fixture(autouse=True)
+    def _stub_feeds(self, monkeypatch):
+        self.rows = [_quote_row(), _quote_row(asset="ARB")]
+        monkeypatch.setattr(c, "_kraken_feed", _buffering_feed(self.rows))
+        monkeypatch.setattr(c, "_okx_feed", _idle_feed)
+
+    def _config(self, tmp_path, **kw):
+        kw.setdefault("duration_sec", 0.0)
+        return c.CollectorConfig(out_dir=tmp_path, flush_interval_sec=3600.0, **kw)
+
+    @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+    def test_signal_runs_the_final_flush(self, tmp_path, sig):
+        """The regression test: SIGTERM/SIGINT must flush, not kill the process."""
+        _run_with_signal(self._config(tmp_path), sig)
+
+        df = pd.read_csv(next(tmp_path.glob("tob_2*.csv")))
+        assert len(df) == 2
+        assert set(df["asset"]) == {"BTC", "ARB"}
+
+    def test_signal_also_flushes_the_events_log(self, tmp_path):
+        _run_with_signal(self._config(tmp_path), signal.SIGTERM)
+
+        ev = pd.read_csv(next(tmp_path.glob("tob_events_*.csv")))
+        assert list(ev.columns) == c.EVENT_COLUMNS
+        assert ev["event"].iloc[0] == "connected"
+
+    def test_signal_returns_rather_than_raising(self, tmp_path):
+        """A clean stop is not an error: `systemctl stop` should exit 0."""
+        _run_with_signal(self._config(tmp_path), signal.SIGTERM)  # must not raise
+
+    def test_duration_elapsing_also_flushes(self, tmp_path):
+        """The pre-existing smoke-test path must keep working."""
+        asyncio.run(c.run_collector(self._config(tmp_path, duration_sec=0.1)))
+
+        df = pd.read_csv(next(tmp_path.glob("tob_2*.csv")))
+        assert len(df) == 2
+
+    def test_handlers_are_restored_after_shutdown(self, tmp_path):
+        """Leaving a handler installed would silently break the next run in-process."""
+        before = {s: signal.getsignal(s) for s in c.SHUTDOWN_SIGNALS}
+
+        _run_with_signal(self._config(tmp_path), signal.SIGTERM)
+
+        assert {s: signal.getsignal(s) for s in c.SHUTDOWN_SIGNALS} == before
+
+    def test_feed_crash_propagates_and_still_flushes(self, tmp_path, monkeypatch):
+        """A dying feed must surface (as `gather` used to) without losing the buffer."""
+        rows = self.rows
+
+        async def dying_feed(config, buffer, events):
+            buffer.extend(rows)
+            await asyncio.sleep(0.01)
+            raise RuntimeError("feed died")
+
+        monkeypatch.setattr(c, "_kraken_feed", dying_feed)
+
+        with pytest.raises(RuntimeError, match="feed died"):
+            asyncio.run(c.run_collector(self._config(tmp_path)))
+
+        df = pd.read_csv(next(tmp_path.glob("tob_2*.csv")))
+        assert len(df) == 2
+
+    def test_periodic_writer_is_not_what_wrote_the_rows(self, tmp_path):
+        """Guard the guard: with a 1 h flush interval nothing writes on its own."""
+        async def driver():
+            config = self._config(tmp_path, duration_sec=0.05)
+            task = asyncio.create_task(c.run_collector(config))
+            await asyncio.sleep(0.02)
+            assert list(tmp_path.glob("tob_2*.csv")) == []   # nothing yet
+            await task
+
+        asyncio.run(driver())
+        assert len(list(tmp_path.glob("tob_2*.csv"))) == 1   # only the final flush
+
+
+class TestShutdownHandlerInstall:
+
+    def test_install_and_remove_round_trip(self):
+        async def check():
+            loop = asyncio.get_running_loop()
+            stop = asyncio.Event()
+            installed = c._install_shutdown_handlers(loop, stop)
+            assert set(installed) == set(c.SHUTDOWN_SIGNALS)
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(0.05)
+            assert stop.is_set()
+            c._remove_shutdown_handlers(loop, installed)
+
+        asyncio.run(check())
+
+    def test_install_tolerates_an_unsupported_platform(self, monkeypatch):
+        """Windows / non-main-thread: warn and fall back, never crash."""
+        async def check():
+            loop = asyncio.get_running_loop()
+            monkeypatch.setattr(
+                loop, "add_signal_handler",
+                lambda *a, **k: (_ for _ in ()).throw(NotImplementedError()))
+            assert c._install_shutdown_handlers(loop, asyncio.Event()) == []
+
+        asyncio.run(check())
