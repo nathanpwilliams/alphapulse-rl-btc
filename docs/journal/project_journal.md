@@ -458,3 +458,62 @@ ask on the other, net of fees) and rerun the excursion analysis. Candidates are
 believed only if executable excursions survive.
 
 ---
+## 2026-10-13 — Phase B: live top-of-book collection and executable-gap analysis — cross-venue alt arb rejected
+
+**Status:** Collected 11.2 days of live best bid/ask from Kraken Futures and OKX
+(ARB, NEAR, UNI; BTC control) on a dedicated droplet: 71.5M rows, 4.4 GB, zero
+service restarts, one 397 s Kraken outage masked. Ran the executable-gap analysis
+against a success bar fixed before any data existed. Every criterion failed. Cross-
+venue Kraken–OKX arbitrage on these alts is rejected.
+
+### What I did
+Deployed the websocket collector as a systemd service under an unprivileged user
+(Phase 0–2, each gated on approval); health check at day 11; stopped, rsynced 71.5M
+rows to the Mac, and added a chunked streaming driver (peak RSS 0.78 GB) around the
+unmodified analyzer. Reported excursion counts, durations, size-capped capacity,
+daily capturable dollars, hour-of-day and weekday/weekend splits, and direction.
+
+### What the data showed
+- BTC control: 276 net-positive excursions, best +41 bps, 88.8% lasting ≤1.0 s —
+  not ~0 as required. BTC dollars concentrate on two volatile days.
+- Alts: ARB 272, NEAR 527, UNI 508 excursions/day; 50–65% ≤1.0 s. Raw mean
+  capturable: ARB $3/day, NEAR $54, UNI $44 (medians $3/$28/$22).
+- Restricting to excursions >1 s (above the Kraken ticker floor): ARB $2, NEAR $25,
+  UNI $17 per day.
+- Direction: 87–97% of alt excursions are sell-Kraken/buy-OKX, persistent all 12
+  days, matching Phase A's structural premium ordering. The mean-reverting minority
+  direction totals $2 / $61 / $135 over 268 h (ARB/UNI/NEAR).
+
+### What I learned
+- The control failing is the key result: Kraken's ~1 s snapshot feed vs OKX's tick-
+  by-tick stream manufactures sub-second phantom gaps during fast moves (stale-quote
+  illusion). Apparent dollars scale with volatility because they are latency, not
+  mispricing. Without the control, NEAR/UNI would have read as a ~$50/day edge.
+- The persistent one-sided component is the USD/USDT quote-currency premium leaking
+  through raw (non-mean-removed) gaps. It has no closing leg without paying the
+  transfer friction that sustains it, so it is not an arbitrage.
+- Phase A's liquidity ordering (ARB most dislocated) did not reproduce at quote
+  resolution; ARB has the smallest capacity and least money.
+- Pre-registering the bar (BTC ~0; >1 s filter; symmetry) is what kept a ten-day
+  wait from turning into a rationalized marginal result.
+- Ops: SIGTERM did not run the collector's final flush (no handler installed;
+  ~200 rows lost); macOS openrsync rejects --info=stats2 and the first pull was a
+  silent no-op caught by a row-count check; collector RSS grew to 429 MB over 11
+  days (bounded run, but a leak signature to check before any month-long run).
+
+### Where the project stands
+Five strategies rejected on evidence with mechanisms: RL directional (overfits),
+funding arb (sign-flip cadence), regime filter (lag), regime-conditional RL
+(dimensional overfit), cross-venue alt dislocation (structural premium + latency
+artifact; transient edge ≈ single-digit $/day). Common thread: edges reachable from
+retail infrastructure on centralized venues are already captured by faster capital;
+the recorded sub-second excursions are other participants' trades. The thin-alt
+bid-ask spread that made the arb uncapturable is the one income source on the
+original list not yet measured (passive spread capture / market making).
+
+### What's next
+Decision with the lead: consolidate the platform as the deliverable (README/writeup
+of the five-rejection arc), optionally one data-only analysis of passive spread-
+capture economics on NEAR/UNI using the existing 11-day quote set.
+
+---
