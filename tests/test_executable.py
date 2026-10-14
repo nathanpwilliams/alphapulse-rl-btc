@@ -160,3 +160,97 @@ class TestCompare:
     def test_ratio_nan_when_no_candle(self):
         r = ex.compare_to_candle(1.0, 0.0)
         assert np.isnan(r["ratio"])
+
+
+# ============================================================
+# Size units: OKX quotes contracts, Kraken quotes base currency
+# ============================================================
+#
+# `cap_best_usd` takes a min() ACROSS the two venues' sizes, so both legs must be
+# converted to base units FIRST. Comparing them raw mixed units and was a real
+# bug in the Phase B capacity figures (OKX BTC notional came out 100x large).
+
+class TestSizeUnits:
+
+    def test_okx_contracts_are_converted_before_the_min(self):
+        """The regression test: OKX size x ctVal must happen BEFORE min()."""
+        base = 1_700_000_000_000
+        ts = [base, base + 1000, base + 2000]
+        # Raw sizes: kraken 5 (base units), okx 100 (contracts).
+        # With ctVal = 0.01 the OKX leg is 1.0 base units -> OKX binds, not Kraken.
+        # Taking min() on the RAW numbers would pick kraken's 5 and overstate 5x.
+        k = quotes(ts, bid=101.5, ask=101.6, bid_size=5.0, ask_size=5.0)
+        o = quotes(ts, bid=99.9, ask=100.0, bid_size=100.0, ask_size=100.0)
+        cfg = ex.ExecutableConfig(staleness_tolerance="500ms", okx_size_mult=0.01)
+
+        m = ex.build_executable_series(k, o, cfg)
+
+        mid = (101.5 + 101.6 + 99.9 + 100.0) / 4.0
+        assert m["cap_best_usd"].iloc[-1] == pytest.approx(1.0 * mid, rel=1e-9)
+        assert bool(m["okx_leg_binds"].iloc[-1]) is True
+
+    def test_kraken_leg_can_bind_after_conversion(self):
+        base = 1_700_000_000_000
+        ts = [base, base + 1000, base + 2000]
+        # kraken 2 base units vs okx 1000 contracts x 0.01 = 10 base units.
+        k = quotes(ts, bid=101.5, ask=101.6, bid_size=2.0, ask_size=2.0)
+        o = quotes(ts, bid=99.9, ask=100.0, bid_size=1000.0, ask_size=1000.0)
+        cfg = ex.ExecutableConfig(staleness_tolerance="500ms", okx_size_mult=0.01)
+
+        m = ex.build_executable_series(k, o, cfg)
+
+        mid = (101.5 + 101.6 + 99.9 + 100.0) / 4.0
+        assert m["cap_best_usd"].iloc[-1] == pytest.approx(2.0 * mid, rel=1e-9)
+        assert bool(m["okx_leg_binds"].iloc[-1]) is False
+
+    def test_multiplier_scales_capacity_linearly(self):
+        base = 1_700_000_000_000
+        ts = [base, base + 1000, base + 2000]
+        k = quotes(ts, bid=101.5, ask=101.6, bid_size=1e9, ask_size=1e9)  # never binds
+        o = quotes(ts, bid=99.9, ask=100.0, bid_size=50.0, ask_size=50.0)
+
+        one = ex.build_executable_series(
+            k, o, ex.ExecutableConfig(staleness_tolerance="500ms", okx_size_mult=1.0))
+        ten = ex.build_executable_series(
+            k, o, ex.ExecutableConfig(staleness_tolerance="500ms", okx_size_mult=10.0))
+
+        assert ten["cap_best_usd"].iloc[-1] == pytest.approx(
+            10.0 * one["cap_best_usd"].iloc[-1], rel=1e-9)
+
+    def test_units_do_not_affect_the_gap_or_excursion_count(self):
+        """Capacity is a size metric; the bps edge must be untouched by ctVal."""
+        base = 1_700_000_000_000
+        ts = [base + i * 1000 for i in range(6)]
+        kbid = [100.0, 101.5, 100.0, 100.0, 101.5, 100.0]
+        k = quotes(ts, bid=kbid, ask=[b + 0.1 for b in kbid], bid_size=500.0, ask_size=500.0)
+        o = quotes(ts, bid=99.9, ask=100.0, bid_size=800.0, ask_size=300.0)
+
+        a = ex.analyze_executable(k, o, ex.ExecutableConfig(outage_gap_sec=10.0))
+        b = ex.analyze_executable(
+            k, o, ex.ExecutableConfig(outage_gap_sec=10.0, okx_size_mult=10.0))
+
+        assert a["executable"]["n_excursions"] == b["executable"]["n_excursions"]
+        assert a["net_gap_bps"] == b["net_gap_bps"]
+        assert b["executable"]["mean_capacity_usd"] > a["executable"]["mean_capacity_usd"]
+
+    @pytest.mark.parametrize("asset,expected", [
+        ("BTC", 0.01), ("NEAR", 10.0), ("UNI", 1.0), ("ARB", 10.0),
+    ])
+    def test_for_asset_resolves_the_published_ctval(self, asset, expected):
+        """ctVal from GET /api/v5/public/instruments?instType=SWAP, read 2026-10-14."""
+        cfg = ex.ExecutableConfig.for_asset(asset)
+
+        assert cfg.okx_size_mult == expected
+        assert cfg.kraken_size_mult == 1.0
+
+    def test_for_asset_keeps_other_overrides(self):
+        cfg = ex.ExecutableConfig.for_asset("NEAR", kraken_fee_bps=3.0, okx_fee_bps=3.0)
+
+        assert cfg.okx_size_mult == 10.0
+        assert cfg.kraken_fee_bps == 3.0
+
+    def test_default_config_is_unconverted(self):
+        """Bare ExecutableConfig stays 1.0/1.0 so synthetic base-unit tests hold."""
+        cfg = ex.ExecutableConfig()
+
+        assert cfg.kraken_size_mult == 1.0 and cfg.okx_size_mult == 1.0

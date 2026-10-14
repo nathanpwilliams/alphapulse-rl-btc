@@ -39,7 +39,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.data.collect_top_of_book import KRAKEN_TAKER_BPS, OKX_TAKER_BPS
+from src.data.collect_top_of_book import (
+    KRAKEN_TAKER_BPS,
+    OKX_TAKER_BPS,
+    size_multiplier,
+)
 from src.strategies.dislocation.scanner import _find_runs, _half_life
 
 logger = logging.getLogger(__name__)
@@ -64,6 +68,14 @@ class ExecutableConfig:
             published 5 bps each).
         outage_gap_sec: a gap longer than this between consecutive merged updates
             is flagged as a feed outage and excluded from the active-time base.
+        kraken_size_mult, okx_size_mult: base units per quoted size unit, per
+            venue. `cap_best_usd` takes a min() ACROSS the two venues' sizes, so
+            both must be in base units first - OKX quotes SWAP size in contracts
+            (ctVal), Kraken in base currency. Defaults are 1.0/1.0, which is
+            correct only for already-converted or synthetic input; use
+            `ExecutableConfig.for_asset()` to resolve them from the real ctVal
+            table. Leaving OKX at 1.0 misstates capacity by the contract value
+            (100x on BTC).
     """
 
     staleness_tolerance: str = "500ms"
@@ -71,6 +83,19 @@ class ExecutableConfig:
     kraken_fee_bps: float = KRAKEN_TAKER_BPS
     okx_fee_bps: float = OKX_TAKER_BPS
     outage_gap_sec: float = 10.0
+    kraken_size_mult: float = 1.0
+    okx_size_mult: float = 1.0
+
+    @classmethod
+    def for_asset(cls, asset: str, **kwargs: Any) -> "ExecutableConfig":
+        """Config with both venues' size multipliers resolved for `asset`.
+
+        Prefer this over the bare constructor whenever the input is real
+        collector data, so `cap_best_usd` compares like with like.
+        """
+        kwargs.setdefault("kraken_size_mult", size_multiplier("kraken", asset))
+        kwargs.setdefault("okx_size_mult", size_multiplier("okx", asset))
+        return cls(**kwargs)
 
 
 # ============================================================
@@ -109,7 +134,11 @@ def build_executable_series(
     At every update time (union of both venues' ts_recv), take each venue's most
     recent quote within `staleness_tolerance` (backward as-of join); rows where
     either venue is stale are dropped. Returns a DataFrame with the two gross and
-    net (fee-deducted) gaps in bps, `net_best_bps`, and `cap_best_usd`.
+    net (fee-deducted) gaps in bps, `net_best_bps`, `cap_best_usd`, and
+    `okx_leg_binds` (whether OKX's depth was the binding side).
+
+    `cap_best_usd` converts both venues' sizes to base units via the config's
+    size multipliers BEFORE taking the min(); see `ExecutableConfig.for_asset`.
     """
     for name, q in (("kraken_q", kraken_q), ("okx_q", okx_q)):
         if not isinstance(q.index, pd.DatetimeIndex):
@@ -144,8 +173,19 @@ def build_executable_series(
     m["net_best_bps"] = m[["net_sell_k_buy_o_bps", "net_sell_o_buy_k_bps"]].max(axis=1)
 
     # Size-capped USD capacity of the WINNING direction at each row.
-    cap_a = np.minimum(m["k_bid_size"], m["o_ask_size"]) * mid  # sell kraken / buy okx
-    cap_b = np.minimum(m["o_bid_size"], m["k_ask_size"]) * mid  # sell okx / buy kraken
+    # CONVERT TO BASE UNITS BEFORE THE min(): Kraken quotes base currency, OKX
+    # quotes contracts. Taking the min() of raw sizes compares different units.
+    k_bid_base = m["k_bid_size"] * config.kraken_size_mult
+    k_ask_base = m["k_ask_size"] * config.kraken_size_mult
+    o_bid_base = m["o_bid_size"] * config.okx_size_mult
+    o_ask_base = m["o_ask_size"] * config.okx_size_mult
+    cap_a = np.minimum(k_bid_base, o_ask_base) * mid  # sell kraken / buy okx
+    cap_b = np.minimum(o_bid_base, k_ask_base) * mid  # sell okx / buy kraken
+    # Which venue's depth bound the trade - the diagnostic that reveals a units
+    # error (a leg that binds ~always is a red flag).
+    m["okx_leg_binds"] = np.where(
+        m["net_sell_k_buy_o_bps"] >= m["net_sell_o_buy_k_bps"],
+        o_ask_base <= k_bid_base, o_bid_base <= k_ask_base)
     m["cap_best_usd"] = np.where(
         m["net_sell_k_buy_o_bps"] >= m["net_sell_o_buy_k_bps"], cap_a, cap_b)
     return m

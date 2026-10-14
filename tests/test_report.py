@@ -317,3 +317,88 @@ def test_default_mask_is_the_kraken_outage():
     """The committed Phase B numbers depend on this exact window."""
     (a, b), = rp.PHASE_B_MASK
     assert (pd.Timestamp(b, tz="UTC") - pd.Timestamp(a, tz="UTC")).total_seconds() == 397.0
+
+
+# ============================================================
+# Capacity units + the three committed views
+# ============================================================
+
+def test_capacity_stats_reports_the_binding_leg_fraction():
+    recs = ([rec("20261005", cap_usd=10.0) | {"okx_leg_binds": True}] * 3
+            + [rec("20261005", cap_usd=20.0) | {"okx_leg_binds": False}])
+
+    c = rp.capacity_stats(recs)
+
+    assert c["frac_okx_binds"] == pytest.approx(0.75)
+    assert c["median"] == pytest.approx(10.0)
+
+
+def test_capacity_stats_omits_binding_fraction_when_absent():
+    """Older records without the flag must not crash the table."""
+    c = rp.capacity_stats([rec("20261005", cap_usd=5.0)])
+
+    assert "frac_okx_binds" not in c
+
+
+def test_minority_direction_picks_the_less_common_side():
+    recs = ([rec("20261005", direction="sell_k_buy_o")] * 9
+            + [rec("20261005", direction="sell_o_buy_k")])
+
+    assert rp.minority_direction(recs) == "sell_o_buy_k"
+    assert rp.minority_direction([]) is None
+
+
+def test_filtered_views_apply_duration_then_direction():
+    recs = (
+        # 6 sub-floor, majority direction -> excluded from both filtered views
+        [rec("20261005", duration=0.5, direction="sell_k_buy_o")] * 6
+        # 3 above-floor, majority -> in `above_floor` only
+        + [rec("20261005", duration=3.0, direction="sell_k_buy_o", cap_usd=1000.0,
+               net_bps=10.0)] * 3
+        # 1 above-floor, MINORITY -> in both filtered views
+        + [rec("20261005", duration=4.0, direction="sell_o_buy_k", cap_usd=2000.0,
+               net_bps=10.0)]
+    )
+
+    v = rp.filtered_views(recs, clean_h=24.0, floor_sec=1.0)
+
+    assert v["minority_direction"] == "sell_o_buy_k"
+    assert v["all"]["n"] == 10
+    assert v["above_floor"]["n"] == 4
+    assert v["transient_above_floor"]["n"] == 1
+    # $1.00 x 3 + $2.00 x 1 = $5.00 above floor; $2.00 transient.
+    assert v["above_floor"]["total_usd"] == pytest.approx(5.0)
+    assert v["transient_above_floor"]["total_usd"] == pytest.approx(2.0)
+    assert v["transient_above_floor"]["median_cap_usd"] == pytest.approx(2000.0)
+
+
+def test_filtered_views_rate_normalise_a_partial_day():
+    recs = [rec("20261013", duration=3.0, cap_usd=1000.0, net_bps=10.0)]
+
+    v = rp.filtered_views(recs, clean_h=6.0, floor_sec=1.0)
+
+    assert v["all"]["per_day"] == pytest.approx(4.0)       # 1 / 6 h x 24
+    assert v["all"]["usd_per_day"] == pytest.approx(4.0)   # $1.00 / 6 h x 24
+
+
+def test_filtered_views_handle_zero_records():
+    v = rp.filtered_views([], clean_h=24.0)
+
+    assert v["all"]["n"] == 0 and v["all"]["total_usd"] == 0.0
+    assert v["minority_direction"] is None
+
+
+def test_summarize_includes_views_and_format_renders_them():
+    config = rp.ReportConfig(assets=("ARB",), mask_windows=())
+    recs = [rec("20261005", duration=2.0, direction="sell_k_buy_o"),
+            rec("20261005", duration=0.5, direction="sell_o_buy_k")]
+    results = {"ARB": {"asset": "ARB",
+                       "per_day": {"20261005": day_stats(recs, 24.0, best_net_bps=12.0)},
+                       "records": recs}}
+
+    s = rp.summarize(results, config)
+    text = rp.format_report(s, config)
+
+    assert s["ARB"]["views"]["above_floor"]["n"] == 1
+    assert "VIEWS" in text and "transient" in text
+    assert "OKX leg binds" in text

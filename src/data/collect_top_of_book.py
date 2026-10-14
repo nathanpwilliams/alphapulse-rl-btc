@@ -71,6 +71,48 @@ EVENT_COLUMNS = ["ts_recv", "venue", "asset", "event", "detail"]
 
 DEFAULT_SYMBOLS = ["ARB", "NEAR", "UNI", "BTC"]
 
+# ------------------------------------------------------------
+# Size units: the two venues do NOT agree
+# ------------------------------------------------------------
+# The collector records each venue's `bid_size`/`ask_size` VERBATIM, and they are
+# in different units:
+#   * Kraken Futures PF_ perps quote size in the BASE currency (e.g. BTC).
+#   * OKX SWAP quotes size in CONTRACTS. Converting to base units needs ctVal
+#     (base units per contract), from GET /api/v5/public/instruments?instType=SWAP,
+#     read 2026-10-14 (ctMult is 1 on all four):
+#         BTC-USDT-SWAP  ctVal 0.01 BTC    NEAR-USDT-SWAP  ctVal 10 NEAR
+#         UNI-USDT-SWAP  ctVal 1    UNI    ARB-USDT-SWAP   ctVal 10 ARB
+#
+# ANY cross-venue size comparison must convert FIRST. Comparing them raw - e.g.
+# min(kraken_size, okx_size) - silently mixes units and was a real bug in the
+# Phase B capacity figures (OKX BTC notional came out 100x too large).
+OKX_CONTRACT_SIZE: dict[str, float] = {"BTC": 0.01, "NEAR": 10.0, "UNI": 1.0, "ARB": 10.0}
+
+
+def size_multiplier(venue: str, asset: str) -> float:
+    """Base units per quoted size unit for (venue, asset).
+
+    Multiply a raw `bid_size`/`ask_size` by this to get base-currency units,
+    which is the only form in which the two venues' sizes may be compared.
+
+    Args:
+        venue: "kraken" or "okx".
+        asset: base asset, e.g. "BTC" (case-insensitive).
+
+    Returns:
+        ctVal for an OKX swap; 1.0 for Kraken (already base units). An OKX asset
+        missing from `OKX_CONTRACT_SIZE` returns 1.0 and logs a warning - add it
+        to the table rather than relying on that fallback.
+    """
+    if venue.lower() != "okx":
+        return 1.0
+    mult = OKX_CONTRACT_SIZE.get(asset.upper())
+    if mult is None:
+        logger.warning("No OKX ctVal for %s; assuming 1.0 base unit/contract, which "
+                       "is probably wrong. Add it to OKX_CONTRACT_SIZE.", asset)
+        return 1.0
+    return mult
+
 
 # ============================================================
 # Symbol mapping

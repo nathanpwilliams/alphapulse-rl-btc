@@ -276,3 +276,50 @@ def test_daily_files_excludes_events_log(tmp_path):
     files = st.daily_files(tmp_path)
 
     assert [f.name for f in files] == ["tob_20261001.csv"]
+
+
+# ============================================================
+# Size units threaded through the driver
+# ============================================================
+
+def test_asset_resolves_the_okx_contract_multiplier(tmp_path):
+    """A ctVal > 1 enlarges the OKX leg, so a Kraken-bound cap is unaffected."""
+    write_day(tmp_path, "20261001", dislocated_rows("20261001", "NEAR", at=[10]))
+    k, o = st.load_asset_day(tmp_path / "tob_20261001.csv", "NEAR", _cfg())
+
+    without = st.asset_day_records(k, o, _cfg())[0]          # multipliers 1.0/1.0
+    with_asset = st.asset_day_records(k, o, _cfg(), "NEAR")[0]   # OKX ctVal = 10
+
+    assert len(without) == len(with_asset) == 1
+    # sell-kraken/buy-okx: cap = min(k_bid 3, o_ask 5 x mult) x mid.
+    # mult=1 -> min(3, 5)=3; mult=10 -> min(3, 50)=3. Kraken binds either way.
+    assert without[0]["okx_leg_binds"] is False
+    assert with_asset[0]["okx_leg_binds"] is False
+    assert with_asset[0]["cap_usd"] == pytest.approx(without[0]["cap_usd"])
+    assert with_asset[0]["cap_usd"] == pytest.approx(3.0 * with_asset[0]["mid"], rel=1e-9)
+
+
+def test_contract_multiplier_changes_capacity_when_okx_binds(tmp_path):
+    """BTC ctVal 0.01 shrinks the OKX leg 100x, so it becomes the binding side."""
+    rows = dislocated_rows("20261001", "BTC", at=[10])
+    write_day(tmp_path, "20261001", rows)
+    k, o = st.load_asset_day(tmp_path / "tob_20261001.csv", "BTC", _cfg())
+
+    plain = st.asset_day_records(k, o, _cfg())[0]
+    btc = st.asset_day_records(k, o, _cfg(), "BTC")[0]
+
+    assert btc[0]["cap_usd"] < plain[0]["cap_usd"]
+    assert btc[0]["okx_leg_binds"] is True
+    # cap scales with the OKX leg: 5 contracts x 0.01 = 0.05 base units.
+    assert btc[0]["cap_usd"] == pytest.approx(0.05 * btc[0]["mid"], rel=1e-9)
+
+
+def test_analyze_streaming_passes_the_asset_through(tmp_path):
+    write_day(tmp_path, "20261001", dislocated_rows("20261001", "BTC", at=[10]))
+
+    res = st.analyze_streaming(tmp_path, "BTC", _cfg())
+
+    assert len(res["records"]) == 1
+    r = res["records"][0]
+    assert r["okx_leg_binds"] is True
+    assert r["cap_usd"] == pytest.approx(0.05 * r["mid"], rel=1e-9)

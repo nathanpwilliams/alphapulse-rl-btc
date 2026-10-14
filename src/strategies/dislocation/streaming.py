@@ -10,7 +10,7 @@ time, keeping only per-excursion summary records in memory:
     for each daily tob_YYYYMMDD.csv:
         for each asset:
             read the file in chunks, keep only that asset's rows  <- bounded memory
-            build_executable_series(...)                          <- reused, unmodified
+            build_executable_series(...)                          <- reused as-is
             extract one record per net-positive excursion          <- small
             discard the slice
 
@@ -28,12 +28,20 @@ opportunity. `mask_windows` drops rows inside each [start, end) window before
 alignment, and the masked seconds are removed from the active-time denominator
 so per-day dollar figures can be reported as rates.
 
+Size units
+----------
+The two venues quote size in different units (Kraken base currency, OKX
+contracts), so this driver resolves the per-venue multipliers from the asset
+before calling the analyzer - see `collect_top_of_book.size_multiplier`. Pass
+`asset` to `asset_day_records`, or `cap_usd` silently mixes units.
+
 Per-excursion conventions (one row per excursion, evaluated at its BEST moment)
 ------------------------------------------------------------------------------
 Each excursion is a maximal run of `net_best_bps > 0`. Its single representative
-row is the run's argmax of `net_best_bps`; `cap_usd`, `net_bps` and `direction`
-are all read from THAT row, so capacity and edge are internally consistent
-(taking max capacity and max edge independently would overstate the product).
+row is the run's argmax of `net_best_bps`; `cap_usd`, `net_bps`, `direction` and
+`okx_leg_binds` are all read from THAT row, so capacity and edge are internally
+consistent (taking max capacity and max edge independently would overstate the
+product).
 
     capturable_usd = cap_usd * net_bps / 10000
 
@@ -51,14 +59,14 @@ from __future__ import annotations
 import argparse
 import glob
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
 import pandas as pd
 
-from src.data.collect_top_of_book import TOB_COLUMNS
+from src.data.collect_top_of_book import TOB_COLUMNS, size_multiplier
 from src.strategies.dislocation.executable import (
     ExecutableConfig,
     _detect_outages,
@@ -186,8 +194,17 @@ def load_asset_day(
 
 def asset_day_records(
     kraken_q: pd.DataFrame, okx_q: pd.DataFrame, config: StreamConfig,
+    asset: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Per-excursion records + coverage stats for one (asset, day) slice.
+
+    Args:
+        kraken_q, okx_q: one asset-day's quotes per venue.
+        config: driver config.
+        asset: the asset these quotes are for. Supplying it resolves the
+            per-venue SIZE multipliers (OKX quotes contracts, Kraken base
+            units), without which `cap_usd` mixes units. None keeps the
+            config's multipliers as-is, for synthetic base-unit input.
 
     Returns:
         (records, stats). Each record describes one net-positive excursion
@@ -203,7 +220,12 @@ def asset_day_records(
     if len(kraken_q) < config.min_rows or len(okx_q) < config.min_rows:
         return [], empty_stats
 
-    m = build_executable_series(kraken_q, okx_q, config.executable)
+    ec = config.executable
+    if asset is not None:
+        ec = replace(ec,
+                     kraken_size_mult=size_multiplier("kraken", asset),
+                     okx_size_mult=size_multiplier("okx", asset))
+    m = build_executable_series(kraken_q, okx_q, ec)
     if len(m) < config.min_rows:
         return [], empty_stats
 
@@ -212,6 +234,7 @@ def asset_day_records(
     cap = m["cap_best_usd"].to_numpy(dtype=float)
     mid = m["mid"].to_numpy(dtype=float)
     k_dir = (m["net_sell_k_buy_o_bps"] >= m["net_sell_o_buy_k_bps"]).to_numpy()
+    okx_binds = m["okx_leg_binds"].to_numpy(dtype=bool)
     n = len(net)
 
     n_outages, outage_seconds = _detect_outages(idx, config.executable.outage_gap_sec)
@@ -246,6 +269,7 @@ def asset_day_records(
             "mid": float(mid[j]),
             "capturable_usd": float(cap_j) * net_j / 10000.0 if np.isfinite(cap_j) else float("nan"),
             "direction": "sell_k_buy_o" if k_dir[j] else "sell_o_buy_k",
+            "okx_leg_binds": bool(okx_binds[j]),
         })
     return records, stats
 
@@ -257,7 +281,7 @@ def stream_asset(
     for path in daily_files(out_dir):
         day = path.stem.replace("tob_", "")
         k, o = load_asset_day(path, asset, config)
-        recs, stats = asset_day_records(k, o, config)
+        recs, stats = asset_day_records(k, o, config, asset)
         del k, o
         logger.info("%s %s: %d aligned, %d excursions", asset, day, stats["n_aligned"], len(recs))
         yield day, recs, stats

@@ -171,12 +171,72 @@ def duration_stats(records: Iterable[dict[str, Any]], floor_sec: float = RESOLUT
 
 
 def capacity_stats(records: Iterable[dict[str, Any]]) -> dict[str, float]:
-    """Size-capped USD capacity per excursion: median/p90/mean/max."""
-    c = np.array([r["cap_usd"] for r in records], dtype=float)
+    """Size-capped USD capacity per excursion: median/p90/mean/max.
+
+    Sizes are converted to base units per venue before the min() that produces
+    `cap_usd` (OKX quotes contracts); `frac_okx_binds` reports how often OKX's
+    depth was the binding side, which is the diagnostic for that conversion.
+    """
+    recs = list(records)
+    c = np.array([r["cap_usd"] for r in recs], dtype=float)
     if not len(c):
         return {"n": 0}
-    return {"n": int(len(c)), "median": float(np.nanmedian(c)), "p90": _p(c, 90),
-            "mean": float(np.nanmean(c)), "max": float(np.nanmax(c))}
+    binds = [r["okx_leg_binds"] for r in recs if "okx_leg_binds" in r]
+    out = {"n": int(len(c)), "median": float(np.nanmedian(c)), "p90": _p(c, 90),
+           "mean": float(np.nanmean(c)), "max": float(np.nanmax(c))}
+    if binds:
+        out["frac_okx_binds"] = float(np.mean(binds))
+    return out
+
+
+def minority_direction(records: Iterable[dict[str, Any]]) -> str | None:
+    """The less common crossing direction - the only mean-reverting (tradeable) part.
+
+    A persistent one-sided split is a structural premium with no closing leg; the
+    minority side is what an arbitrageur could actually capture.
+    """
+    recs = list(records)
+    if not recs:
+        return None
+    d = direction_split(recs)
+    a, b = d["sell_k_buy_o"], d["sell_o_buy_k"]
+    return "sell_o_buy_k" if b["n"] <= a["n"] else "sell_k_buy_o"
+
+
+def filtered_views(
+    records: Iterable[dict[str, Any]], clean_h: float,
+    floor_sec: float = RESOLUTION_FLOOR_SEC,
+) -> dict[str, dict[str, float]]:
+    """The three committed views: all, >floor, and minority-direction & >floor.
+
+    Each reports excursion count, per-day rate, capacity percentiles and
+    rate-normalised capturable dollars, so the headline can be read at the
+    successively stricter standards without re-deriving them by hand.
+    """
+    recs = list(records)
+    minority = minority_direction(recs)
+    views = {
+        "all": recs,
+        "above_floor": [r for r in recs if r["duration_sec"] > floor_sec],
+        "transient_above_floor": [r for r in recs
+                                  if r["duration_sec"] > floor_sec
+                                  and r["direction"] == minority],
+    }
+    out: dict[str, dict[str, float]] = {}
+    for name, sl in views.items():
+        usd = float(np.nansum([r["capturable_usd"] for r in sl])) if sl else 0.0
+        cap = capacity_stats(sl)
+        out[name] = {
+            "n": len(sl),
+            "per_day": rate_per_day(len(sl), clean_h * 3600.0),
+            "total_usd": usd,
+            "usd_per_day": rate_per_day(usd, clean_h * 3600.0),
+            "median_cap_usd": cap.get("median", float("nan")),
+            "p90_cap_usd": cap.get("p90", float("nan")),
+            "max_cap_usd": cap.get("max", float("nan")),
+        }
+    out["minority_direction"] = minority
+    return out
 
 
 def net_bps_stats(records: Iterable[dict[str, Any]]) -> dict[str, float]:
@@ -301,6 +361,7 @@ def summarize(results: dict[str, dict[str, Any]], config: ReportConfig) -> dict[
                                     if recs else 0.0,
             "durations": duration_stats(recs, config.resolution_floor_sec),
             "capacity": capacity_stats(recs),
+            "views": filtered_views(recs, ch, config.resolution_floor_sec),
             "net_bps": net_bps_stats(recs),
             "daily": daily,
             "usd_per_day": daily_summary(daily, "usd_per_day"),
@@ -393,14 +454,31 @@ def format_report(summary: dict[str, Any], config: ReportConfig) -> str:
     # -------- capacity
     L.append("\n### SIZE-CAPPED CAPACITY PER EXCURSION (USD, min(bid_size,ask_size) x mid "
              "at the peak-net row)\n")
-    L.append(f"{'asset':<7}{'median $':>12}{'p90 $':>12}{'mean $':>12}{'max $':>14}")
+    L.append(f"{'asset':<7}{'median $':>12}{'p90 $':>12}{'mean $':>12}{'max $':>14}"
+             f"{'OKX leg binds':>15}")
     for a in assets:
         c = summary[a]["capacity"]
         if not c.get("n"):
             L.append(f"{a:<7}{'-':>12}")
             continue
         L.append(f"{a:<7}{c['median']:>12,.0f}{c['p90']:>12,.0f}{c['mean']:>12,.0f}"
-                 f"{c['max']:>14,.0f}")
+                 f"{c['max']:>14,.0f}{c.get('frac_okx_binds', float('nan')) * 100:>14.1f}%")
+
+    # -------- the three committed views
+    L.append("\n### VIEWS: all / above the resolution floor / minority direction & above floor\n")
+    L.append(f"{'asset':<7}{'view':<24}{'n':>9}{'per day':>10}{'med cap $':>11}"
+             f"{'p90 cap $':>11}{'total $':>11}{'$/day':>9}")
+    for a in assets:
+        v = summary[a].get("views", {})
+        for name in ("all", "above_floor", "transient_above_floor"):
+            e = v.get(name)
+            if e is None:
+                continue
+            label = name if name != "transient_above_floor" else \
+                f"transient ({v.get('minority_direction') or '-'})"
+            L.append(f"{a:<7}{label:<24}{e['n']:>9,}{e['per_day']:>10.2f}"
+                     f"{e['median_cap_usd']:>11,.0f}{e['p90_cap_usd']:>11,.0f}"
+                     f"{e['total_usd']:>11,.0f}{e['usd_per_day']:>9,.0f}")
 
     # -------- dollars
     L.append("\n### DAILY CAPTURABLE DOLLARS  "
