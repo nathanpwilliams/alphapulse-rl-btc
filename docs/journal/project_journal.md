@@ -517,3 +517,64 @@ of the five-rejection arc), optionally one data-only analysis of passive spread-
 capture economics on NEAR/UNI using the existing 11-day quote set.
 
 ---
+## 2026-10-14 — Path B: passive spread-capture feasibility — market making rejected
+
+**Status:** Data-only analysis of market-making economics on NEAR/UNI (ARB extra,
+BTC control) from the 11-day top-of-book set. Pre-registered bar: edge ratio
+(net half-spread ÷ mean adverse markout at τ=1 s) < 1 on both alts → dead. Result:
+dead on both, on both venues, in every hour.
+
+### What I did
+Built src/strategies/mm/spread_feasibility.py (streamed, 1 s grid, outage masked):
+spread distributions, net half-spread after base-tier maker fees (2 bps/side both
+venues), realized σ at 1/5/30 s, a naive touch-quoter adverse-event model
+(trade-through = certain adverse fill) with markouts, edge ratios, touch size,
+300 s inventory drift, hour-of-day and weekday/weekend splits. Fill rates are not
+observable from quotes; the analysis gives per-fill economics only.
+
+### What the data showed (τ=1 s)
+- BTC control: edge ratio −3.2 / −2.5 — correctly unmakeable at 1 s.
+- NEAR: Kraken 0.38 (median spread 8.8 bps, net half +2.4, adverse cost 6.4);
+  OKX −0.47 (spread 2.0 bps — below the 4 bps round-trip maker fee 100% of the time).
+- UNI: Kraken −0.13; OKX −0.91. ARB: Kraken 0.57; OKX −1.10.
+- No hour-of-day on any alt exceeds 0.45. Weekends cut adverse rates 30–60% but
+  leave ratios unchanged.
+- Kraken's ~1 s snapshot undercounts adverse events (43/hr vs 1,123/hr on OKX for
+  the same asset and σ), so Kraken ratios are upper bounds.
+
+### What I learned
+- Two failure modes: on OKX, professional makers already quote alt spreads below a
+  retail maker's fees and inside one second of volatility — a latency/fee-tier arms
+  race; on Kraken, spreads are wide but adverse selection at 1 s costs ~2.5× the net
+  half-spread. Spread width and short-horizon adverse moves scale together, which is
+  why no venue, hour, or weekday/weekend split clears 1.
+- OKX quotes sizes in contracts (ctVal); mixing units with Kraken base sizes was a
+  latent bug that also affected Phase B capacity figures (corrected separately).
+
+### Where the project stands
+Six strategies tested on the original list; all rejected on evidence with a
+mechanism. The platform and methodology are the deliverable.
+
+---
+## 2026-10-14 — Correction: Phase B capacity/dollar figures (OKX contract units)
+
+Phase B's executable analysis computed min(bid_size, ask_size) with Kraken sizes in
+base units and OKX sizes in contracts. Corrected with ctVal (BTC 0.01, NEAR 10,
+UNI 1, ARB 10). Corrected figures (11.2 days, 268.2 clean hours; excursion counts,
+bps, durations and direction splits are unchanged — this is purely a size-unit fix):
+
+| Asset | Capacity median/p90 $ | $/day all | $/day >1 s | $/day transient >1 s | Total raw $ | OKX leg bound |
+| ----- | --------------------: | --------: | ---------: | -------------------: | ----------: | ------------: |
+| BTC   |            76 / 26,509 |        50 |         16 |                   13 |         559 |         12.0% |
+| ARB   |              245 / 911 |        20 |         11 |                    0 |         223 |         65.5% |
+| NEAR  |            514 / 2,190 |       204 |        109 |                   11 |       2,281 |         21.6% |
+| UNI   |              260 / 799 |        45 |         17 |                    1 |         508 |         11.8% |
+
+$/day figures are collection-level rates (total ÷ 268.2 clean h × 24). Previously
+reported medians/totals were: BTC 222/$1,689, ARB 27/$34, NEAR 231/$634, UNI
+260/$508 — UNI is unchanged to the cent because its ctVal is 1, which is the
+expected check that the fix touches only non-unit contract values. The Phase B
+conclusion (BTC control failed via stale-quote artifact; 87–97% one-sided direction
+= structural premium) does not depend on these magnitudes and stands.
+
+---
