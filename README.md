@@ -159,8 +159,9 @@ Deployment, health checks and data pull are in
 These bound what the results above can claim:
 
 - **Funding history is ~1 year.** Kraken's funding record gave 8,838 hourly
-  rates (2025-07-13 → 2026-07-16). The ~10 h sign-flip cadence is measured over
-  one year of one regime mix.
+  rates (2025-07-13 → 2026-07-16) — a rolling ~1-year window, so the count varies
+  with fetch date. The ~10 h sign-flip cadence is measured over one year of one
+  regime mix.
 - **Kraken's quote feed has a ~1 s floor.** It publishes snapshots, not ticks:
   43 adverse events/hour against OKX's 1,123/hour for the same asset at the same
   realized volatility. Every Kraken edge ratio is therefore an *upper bound*, and
