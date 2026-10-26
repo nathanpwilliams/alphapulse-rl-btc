@@ -578,3 +578,87 @@ conclusion (BTC control failed via stale-quote artifact; 87–97% one-sided dire
 = structural premium) does not depend on these magnitudes and stands.
 
 ---
+## 2026-10-25 — Consolidation for public release
+
+**Status:** Research complete, six candidates rejected. Consolidated the platform
+as the deliverable and prepared the repo to be published. Tagged
+`v1.0-research-complete`.
+
+### What I did
+
+Wrote `README.md` (thesis, the six-row results table, method, module map,
+reproductions, infrastructure, limitations) and `docs/findings.md` (the full
+narrative arc — data constraint, funding, regimes, the structural pivot, Phase
+A/B, spread capture — each section as hypothesis / measurement / pre-registered
+bar / result / mechanism). Added an MIT LICENSE. Refreshed `CLAUDE.md`, whose
+architecture table predated the `regime/`, `dislocation/` and `mm/` subpackages
+and whose "key finding" section still described funding arb as under
+exploration; it now records all six findings, the journal policy, and the
+no-AI-trailer commit policy.
+
+Rewrote history with `git filter-repo` ahead of publication: dropped the
+`Co-Authored-By` trailers from 13 commits, removed a 1.86 MB reference PDF
+committed by accident into `tests/` (and added `*.pdf` to `.gitignore`), and
+replaced the collector droplet's IP with `<DROPLET_IP>` across all 7 commits that
+mentioned it. 38 commits before and after; `phase1-complete` survived; 327 tests
+still green; `gitleaks` over full history finds nothing.
+
+### What I learned
+
+- A history rewrite can quietly invalidate commit *messages*, not just content.
+  One commit's subject ended up describing a diff it no longer contained, and had
+  to be retitled after what it actually does; the messages need re-reading after
+  a rewrite, not just the tree.
+- A regex replacement is applied to every blob, so the replacement text has to
+  read correctly in the oldest context as well as the newest. My first pass
+  substituted a new header sentence that duplicated the paragraph above it in the
+  early blobs, and leaked a literal backslash from an over-escaped replacement
+  template. Fixed by reusing the exact sentence the tip already had, so history
+  converges on HEAD's wording instead of inventing a third variant.
+- Writing the README surfaced a figure I had been quoting loosely: the best
+  spread-capture edge ratio anywhere is ARB Kraken 0.57, not NEAR's 0.38 — 0.38
+  is the best of the two *pre-registered* alts. The conclusion is unchanged
+  (everything is below the bar of 1.0), but the headline number was wrong and is
+  now stated accurately in both README and findings.
+
+### Where the project stands
+
+Done as a research program. The six rejections stand with mechanisms; the
+platform, the guards, and the write-up are the artifact. On-chain/DEX venues are
+named as untested, not as a plan.
+
+---
+## 2026-08-08 (backfilled 2026-10-26) — Funding-rate arbitrage: single- and cross-venue, rejected
+
+**Status:** Diagnostic analyzers for perpetual funding arbitrage, run in August 2026
+on live Kraken Futures and OKX funding history. Both the single-venue and the
+cross-venue forms were rejected before any execution code was written.
+
+### What was measured (as of 2026-08-08)
+- Single-venue, Kraken PF_XBTUSD: 8,818 hourly rates (~368 days). Funding positive
+  71.9% of the time; mean +3.77%/yr signed, +6.30%/yr absolute. Sign flips in 9.84%
+  of intervals — mean ~10.2 h between flips. Break-even hold at 20 bps round trip
+  ≈ 278 h (11.6 days); a 5/10/15/20/25 bps cost sweep gave 2.9 / 5.8 / 8.7 / 11.6 /
+  14.5 days — ~70 h even at the aggressive 5 bps floor. Net-after-cost negative at
+  1/3/7-day holds, marginally positive only at 14–30 days.
+- Cross-venue, Kraken vs OKX BTC perps (92-day overlap, OKX API depth limit):
+  spread sign flips every ~6.1 h (worse than single-venue); venue funding
+  correlation +0.145; mean |spread| 0.0705 bps/hr ≈ Kraken's own mean |rate|
+  0.0720 — the spread is Kraken's funding plus noise, not a stable residual.
+- Design detail that mattered: Kraken settles hourly and publishes a per-hour
+  rate; OKX publishes a period rate on a dynamic interval (8 h at the time; the
+  loader infers it from timestamps rather than assuming). Both are normalized to a
+  per-hour basis before any spread is taken; subtracting them directly would have
+  invalidated every downstream number.
+
+### Mechanism
+Sign-flip cadence (~6–10 h) is an order of magnitude shorter than break-even hold
+(~70–280 h) at any achievable cost, so a static position never earns its entry.
+A harvestable cross-venue spread needs highly correlated venues leaving a small,
+stable residual; these two correlate at +0.15, so differencing them compounds
+noise instead of cancelling it.
+
+### Reproduction note (2026-10-25)
+`python -m src.strategies.funding.analyzer` on the then-current year gives mean
+8.60 h between flips and 284 h break-even at 20 bps; `cross_venue` gives Kraken/OKX
+correlation +0.20. Consistent with the August figures.
